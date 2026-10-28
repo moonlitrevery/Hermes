@@ -13,18 +13,23 @@ const el = (tag, cls, text) => {
   return n;
 };
 
+const ROLE_LABEL = { owner: "Owner", admin: "Admin", member: "Member" };
+
 const state = {
   profile: null,
   groups: [],
+  pending: [], // group ids waiting for an admin
   active: null,
-  messages: new Map(), // groupId -> ChatMessage[] sorted by id
-  hasOlder: new Map(), // groupId -> bool
+  messages: new Map(), // groupId -> ChatMessage[]
   unread: new Map(),
+  draft: null, // { groupId, id, text } of a send whose outcome is unknown
 };
+
+const activeGroup = () => state.groups.find((g) => g.id === state.active);
 
 // ---------- dialog ----------
 
-function dialog({ title, text = "", input = null, code = null, ok = "OK", cancel = true, onOk }) {
+function dialog({ title, text = "", input = null, code = null, body = null, ok = "OK", cancel = true, onOk }) {
   const d = $("dialog");
   $("dialog-title").textContent = title;
   $("dialog-text").textContent = text;
@@ -32,6 +37,7 @@ function dialog({ title, text = "", input = null, code = null, ok = "OK", cancel
   $("dialog-input").hidden = !input;
   $("dialog-code").hidden = code == null;
   $("dialog-code").textContent = code ?? "";
+  $("dialog-body").replaceChildren(...(body ? [body] : []));
   $("dialog-cancel").hidden = !cancel;
   $("dialog-ok").textContent = ok;
   if (input) {
@@ -77,7 +83,7 @@ function banner(message) {
   b.textContent = message;
   b.hidden = false;
   clearTimeout(bannerTimer);
-  bannerTimer = setTimeout(() => (b.hidden = true), 5000);
+  bannerTimer = setTimeout(() => (b.hidden = true), 6000);
 }
 
 async function call(cmd, args) {
@@ -100,7 +106,7 @@ function renderProfile() {
 async function editName(required = false) {
   const profile = await dialog({
     title: required ? "Welcome to Hermes" : "Display name",
-    text: "Your name is encrypted inside every message. The server never sees it.",
+    text: "Your name travels encrypted inside your messages. The server never sees it.",
     input: { value: state.profile.display_name, placeholder: "Your name", maxLength: 64 },
     ok: "Save",
     cancel: !required,
@@ -114,26 +120,37 @@ async function editName(required = false) {
 
 // ---------- groups ----------
 
+async function reloadGroups() {
+  state.groups = await invoke("list_groups");
+  state.pending = await invoke("pending_joins");
+  renderGroups();
+  if (state.active) {
+    if (activeGroup()) renderChatChrome();
+    else closeChat();
+  }
+}
+
 function renderGroups() {
   const nav = $("groups");
   nav.replaceChildren(
     ...state.groups.map((g) => {
-      const b = el("button", "group" + (g.id === state.active ? " active" : ""));
+      const b = el("button", "group" + (g.id === state.active ? " active" : "") + (g.removed ? " removed" : ""));
       b.type = "button";
       b.append(el("span", "group-name", g.name));
+      if (g.removed) b.append(el("span", "tag", "removed"));
+      else if (g.role !== "member") b.append(el("span", "tag", ROLE_LABEL[g.role]));
       const n = state.unread.get(g.id) || 0;
       if (n) b.append(el("span", "badge", n > 99 ? "99+" : String(n)));
       b.onclick = () => openGroup(g.id);
       return b;
     }),
   );
-  $("groups-empty").hidden = state.groups.length > 0;
-}
-
-function addGroup(group) {
-  state.groups.push(group);
-  renderGroups();
-  openGroup(group.id);
+  $("pending").replaceChildren(
+    ...state.pending
+      .filter((id) => !state.groups.some((g) => g.id === id))
+      .map(() => el("p", "pending-item", "Waiting for an admin to let you in…")),
+  );
+  $("groups-empty").hidden = state.groups.length > 0 || state.pending.length > 0;
 }
 
 async function createGroup() {
@@ -144,50 +161,115 @@ async function createGroup() {
     onOk: (name) => invoke("create_group", { name }),
   });
   if (group) {
-    addGroup(group);
-    showInvite(group);
+    await reloadGroups();
+    openGroup(group.id);
   }
 }
 
 async function joinGroup() {
-  const group = await dialog({
+  const joined = await dialog({
     title: "Join a group",
-    text: "Paste the invite code a member shared with you.",
-    input: { placeholder: "Invite code", maxLength: 200 },
+    text: "Enter the code an admin shared with you. It works once and only for 5 minutes. An admin's Hermes lets you in automatically.",
+    input: { placeholder: "XXXX-XXXX-XXXX-XXXX", maxLength: 40 },
     ok: "Join",
-    onOk: (invite) => invoke("join_group", { invite }),
+    onOk: (code) => invoke("join_group", { code }),
   });
-  if (group) addGroup(group);
+  if (joined) await reloadGroups();
 }
 
-function showInvite(group) {
-  dialog({
+let inviteTimer;
+async function showInvite() {
+  const group = activeGroup();
+  if (!group) return;
+  const invite = await call("create_invite", { groupId: group.id });
+  const countdown = el("p", "countdown");
+  const expires = new Date(invite.expires_at).getTime();
+  const tick = () => {
+    const left = Math.max(0, Math.round((expires - Date.now()) / 1000));
+    countdown.textContent = left
+      ? `Expires in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}. One person can use it.`
+      : "Expired. Create a new code.";
+  };
+  tick();
+  clearInterval(inviteTimer);
+  inviteTimer = setInterval(tick, 1000);
+  await dialog({
     title: `Invite to ${group.name}`,
-    text: "Anyone with this code can join and read the whole group, so share it only with people you trust, over a channel you trust.",
-    code: group.invite,
+    text: "The code carries no keys. Keep Hermes open: your app admits whoever uses it while it's valid. They will only see messages from that point on.",
+    code: invite.code,
+    body: countdown,
     ok: "Copy",
     onOk: async () => {
-      await navigator.clipboard.writeText(group.invite);
+      await navigator.clipboard.writeText(invite.code);
       banner("Invite code copied.");
     },
+  });
+  clearInterval(inviteTimer);
+}
+
+async function showMembers() {
+  const group = activeGroup();
+  if (!group || group.removed) return;
+  const list = el("ul", "members");
+  const render = async () => {
+    const members = await call("members", { groupId: group.id });
+    list.replaceChildren(
+      ...members.map((m) => {
+        const li = el("li", "member");
+        const who = el("div", "member-who");
+        who.append(el("span", "member-name", (m.name || "Unnamed") + (m.me ? " (you)" : "")), el("span", "fingerprint", m.fingerprint));
+        li.append(who, el("span", "tag", ROLE_LABEL[m.role]));
+        const act = async (fn) => {
+          try {
+            await fn();
+            await render();
+          } catch (e) {
+            $("dialog-error").textContent = String(e);
+          }
+        };
+        if (!m.me && group.role === "owner" && m.role !== "owner") {
+          const promote = m.role === "admin" ? "member" : "admin";
+          const b = el("button", "btn small", m.role === "admin" ? "Make member" : "Make admin");
+          b.type = "button";
+          b.onclick = () => act(() => invoke("set_role", { groupId: group.id, userId: m.user_id, role: promote }));
+          li.append(b);
+        }
+        const canRemove = !m.me && m.role !== "owner" && (group.role === "owner" || (group.role === "admin" && m.role === "member"));
+        if (canRemove) {
+          const b = el("button", "btn small danger", "Remove");
+          b.type = "button";
+          b.onclick = () => act(() => invoke("remove_member", { groupId: group.id, userId: m.user_id }));
+          li.append(b);
+        }
+        return li;
+      }),
+    );
+  };
+  await render();
+  await dialog({
+    title: `${group.name}: members`,
+    text: "Removing someone rotates the group keys: they can't read anything sent afterwards.",
+    body: list,
+    ok: "Done",
+    cancel: false,
   });
 }
 
 async function leaveGroup() {
-  const group = state.groups.find((g) => g.id === state.active);
+  const group = activeGroup();
   if (!group) return;
   const confirmed = await dialog({
-    title: `Leave ${group.name}?`,
-    text: "This removes the group and its key from this device. You'll need the invite code again to rejoin.",
-    ok: "Leave",
+    title: group.removed ? `Delete ${group.name}?` : `Leave ${group.name}?`,
+    text: group.removed
+      ? "This deletes the conversation from this device."
+      : "This deletes the group and its history from this device. You'd need a new invite code to come back.",
+    ok: group.removed ? "Delete" : "Leave",
     onOk: () => invoke("leave_group", { groupId: group.id }).then(() => true),
   });
   if (!confirmed) return;
-  state.groups = state.groups.filter((g) => g.id !== group.id);
   state.messages.delete(group.id);
-  state.active = null;
-  renderGroups();
-  showChat(false);
+  closeChat();
+  await reloadGroups();
 }
 
 // ---------- chat ----------
@@ -198,51 +280,39 @@ function showChat(show) {
   $("app").classList.toggle("in-chat", show);
 }
 
+function closeChat() {
+  state.active = null;
+  renderGroups();
+  showChat(false);
+}
+
+function renderChatChrome() {
+  const g = activeGroup();
+  $("chat-title").textContent = g.name;
+  $("show-invite").hidden = g.removed || g.role === "member";
+  $("show-members").hidden = g.removed;
+  $("leave").textContent = g.removed ? "Delete" : "Leave";
+  $("removed-banner").hidden = !g.removed;
+  $("composer").hidden = g.removed;
+}
+
 async function openGroup(id) {
-  const group = state.groups.find((g) => g.id === id);
-  if (!group) return;
+  if (!state.groups.some((g) => g.id === id)) return;
   state.active = id;
   state.unread.delete(id);
   renderGroups();
-  $("chat-title").textContent = group.name;
+  renderChatChrome();
   showChat(true);
-  renderMessages(true);
-  if (!state.messages.has(id)) {
-    const page = await call("history", { groupId: id, beforeId: null });
-    state.hasOlder.set(id, page.length >= 50);
-    mergeMessages(id, page);
-    if (state.active === id) renderMessages(true);
-  }
-  $("input").focus();
+  state.messages.set(id, await call("messages", { groupId: id }));
+  if (state.active === id) renderMessages(true);
+  if (!activeGroup().removed) $("input").focus();
 }
 
-async function loadOlder() {
-  const id = state.active;
-  const list = state.messages.get(id) || [];
-  if (!list.length) return;
-  const box = $("messages");
-  const before = box.scrollHeight;
-  const page = await call("history", { groupId: id, beforeId: list[0].id });
-  state.hasOlder.set(id, page.length >= 50);
-  mergeMessages(id, page);
-  renderMessages(false);
-  box.scrollTop = box.scrollHeight - before;
-}
-
-function mergeMessages(groupId, incoming) {
-  const list = state.messages.get(groupId) || [];
-  const seen = new Set(list.map((m) => m.id));
-  let added = 0;
-  for (const m of incoming) {
-    if (!seen.has(m.id)) {
-      list.push(m);
-      seen.add(m.id);
-      added++;
-    }
-  }
-  list.sort((a, b) => a.id - b.id);
-  state.messages.set(groupId, list);
-  return added;
+function mergeMessage(m) {
+  const list = state.messages.get(m.group_id);
+  if (!list || list.some((x) => x.id === m.id)) return false;
+  list.push(m);
+  return true;
 }
 
 const timeFmt = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
@@ -252,18 +322,16 @@ function renderMessages(scrollToEnd) {
   const box = $("messages");
   const list = state.messages.get(state.active) || [];
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-  const older = $("load-older");
-  older.hidden = !state.hasOlder.get(state.active);
 
   const nodes = [];
   let prev = null;
   for (const m of list) {
-    const when = new Date(m.created_at);
-    if (!prev || new Date(prev.created_at).toDateString() !== when.toDateString()) {
+    const when = new Date(m.sent_at);
+    if (!prev || new Date(prev.sent_at).toDateString() !== when.toDateString()) {
       nodes.push(el("div", "hint day", dayFmt.format(when)));
       prev = null;
     }
-    const grouped = prev && prev.sender_fingerprint === m.sender_fingerprint && prev.sender_name === m.sender_name;
+    const grouped = prev && prev.sender_credential === m.sender_credential;
     const bubble = el("div", "msg" + (m.mine ? " mine" : "") + (grouped ? " grouped" : ""));
     if (!m.mine && !grouped) {
       const meta = el("div", "msg-meta");
@@ -274,7 +342,7 @@ function renderMessages(scrollToEnd) {
     nodes.push(bubble);
     prev = m;
   }
-  box.replaceChildren(older, ...nodes);
+  box.replaceChildren(...nodes);
   if (scrollToEnd || nearBottom) box.scrollTop = box.scrollHeight;
 }
 
@@ -284,14 +352,20 @@ async function send(e) {
   const text = input.value.trim();
   if (!text || !state.active) return;
   const groupId = state.active;
+  // Reuse the id of a failed attempt with the same text: if that attempt
+  // actually reached the server, everyone still sees the message once.
+  const d = state.draft;
+  const id = d && d.groupId === groupId && d.text === text ? d.id : crypto.randomUUID();
   input.value = "";
   autosize();
   try {
-    const msg = await call("send_message", { groupId, text });
-    mergeMessages(groupId, [msg]);
+    const msg = await call("send_message", { groupId, id, text });
+    state.draft = null;
+    mergeMessage(msg);
     if (state.active === groupId) renderMessages(true);
   } catch {
-    input.value = text; // keep the draft so nothing is lost
+    state.draft = { groupId, id, text };
+    input.value = text;
     autosize();
   }
 }
@@ -315,18 +389,19 @@ function onEvent({ payload }) {
       status.className = "status offline";
       status.title = "Reconnecting… (" + payload.reason + ")";
       break;
+    case "groups_changed":
+      reloadGroups();
+      break;
+    case "join_failed":
+      banner(payload.reason);
+      reloadGroups();
+      break;
     case "message": {
       const m = payload.message;
-      if (!state.groups.some((g) => g.id === m.group_id)) return;
-      // Groups never opened are fetched in full when first opened.
-      if (!state.messages.has(m.group_id) && m.group_id !== state.active) {
-        if (!m.mine) state.unread.set(m.group_id, (state.unread.get(m.group_id) || 0) + 1);
-        renderGroups();
-        return;
-      }
-      const added = mergeMessages(m.group_id, [m]);
-      if (m.group_id === state.active) renderMessages(false);
-      else if (added && !m.mine) {
+      const added = mergeMessage(m);
+      if (m.group_id === state.active) {
+        if (added) renderMessages(false);
+      } else if (!m.mine) {
         state.unread.set(m.group_id, (state.unread.get(m.group_id) || 0) + 1);
         renderGroups();
       }
@@ -340,14 +415,10 @@ async function boot() {
   $("new-group").onclick = createGroup;
   $("join-group").onclick = joinGroup;
   $("profile-chip").onclick = () => editName(false);
-  $("show-invite").onclick = () => showInvite(state.groups.find((g) => g.id === state.active));
+  $("show-invite").onclick = showInvite;
+  $("show-members").onclick = showMembers;
   $("leave").onclick = leaveGroup;
-  $("back").onclick = () => {
-    state.active = null;
-    renderGroups();
-    showChat(false);
-  };
-  $("load-older").onclick = loadOlder;
+  $("back").onclick = closeChat;
   $("composer").onsubmit = send;
   $("input").addEventListener("input", autosize);
   $("input").addEventListener("keydown", (e) => {
@@ -359,10 +430,20 @@ async function boot() {
   });
 
   await listen("hermes", onEvent);
-  state.profile = await invoke("profile");
-  state.groups = await invoke("list_groups");
+  try {
+    state.profile = await invoke("profile");
+  } catch (err) {
+    $("status").className = "status offline";
+    await dialog({
+      title: "Hermes can't open its secure storage",
+      text: String(err) + " Hermes keeps its keys in the system keystore and never writes them to disk in clear.",
+      cancel: false,
+      ok: "OK",
+    });
+    return;
+  }
   renderProfile();
-  renderGroups();
+  await reloadGroups();
 
   if (!state.profile.configured) {
     $("status").className = "status offline";

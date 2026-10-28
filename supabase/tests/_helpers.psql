@@ -1,0 +1,169 @@
+-- =============================================================================
+-- Shared pgTAP fixtures
+-- =============================================================================
+-- Included by every test file with `\ir _helpers.psql`, INSIDE the test's
+-- transaction: everything here is undone by the final ROLLBACK. The .psql
+-- extension keeps pg_prove from running it as a test.
+--
+-- Users are simulated the way the API does it: role `authenticated` plus JWT
+-- claims in request.jwt.claims (auth.uid() reads them from there).
+-- Note that now() is frozen for the whole transaction, so expiry is tested by
+-- moving timestamps into the past.
+-- =============================================================================
+
+create extension if not exists pgtap with schema extensions;
+
+create schema tests;
+grant usage on schema tests to authenticated, anon;
+
+create table tests.users (
+  alias text primary key,
+  id    uuid not null
+);
+
+-- Anonymous user, as created by an anonymous sign-in. The fixture helpers are
+-- SECURITY DEFINER so they can be called while acting as a test user.
+create function tests.mk_user(p_alias text)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_id uuid := gen_random_uuid();
+begin
+  insert into auth.users (id, instance_id, aud, role, is_anonymous, created_at, updated_at)
+  values (v_id, '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', true, now(), now());
+  insert into tests.users (alias, id) values (p_alias, v_id);
+  return v_id;
+end
+$$;
+
+create function tests.uid(p_alias text)
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select u.id from tests.users u where u.alias = p_alias
+$$;
+
+-- Deterministic fake MLS credential (hex Ed25519 public key) per alias.
+create function tests.cred(p_alias text)
+returns text
+language sql
+immutable
+as $$
+  select encode(extensions.digest(p_alias, 'sha256'), 'hex')
+$$;
+
+create function tests.login(p_alias text)
+returns void
+language plpgsql
+as $$
+begin
+  if tests.uid(p_alias) is null then
+    raise exception 'tests.login: unknown test user "%"', p_alias;
+  end if;
+  perform set_config('role', 'authenticated', true);
+  perform set_config('request.jwt.claims',
+    jsonb_build_object('sub', tests.uid(p_alias), 'role', 'authenticated', 'is_anonymous', true)::text, true);
+  -- older auth.uid() implementations read this one instead
+  perform set_config('request.jwt.claim.sub', tests.uid(p_alias)::text, true);
+end
+$$;
+
+create function tests.login_anon()
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('role', 'anon', true);
+  perform set_config('request.jwt.claims', '{"role":"anon"}', true);
+  perform set_config('request.jwt.claim.sub', '', true);
+end
+$$;
+
+-- Back to the test superuser (to arrange data and inspect real state, without RLS).
+create function tests.logout()
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('role', 'none', true);
+  perform set_config('request.jwt.claims', '', true);
+  perform set_config('request.jwt.claim.sub', '', true);
+end
+$$;
+
+-- Fixed group id used by most tests.
+create function tests.gid()
+returns uuid
+language sql
+immutable
+as $$ select 'aaaaaaaa-0000-4000-8000-000000000001'::uuid $$;
+
+-- Valid-looking invite code (16 Crockford base32 characters).
+create function tests.code(p_n integer)
+returns text
+language sql
+immutable
+as $$ select 'C0DE' || lpad(p_n::text, 12, '0') $$;
+
+-- Adds a member directly (as superuser), bypassing the join flow.
+create function tests.add(p_alias text, p_role public.group_role, p_joined_epoch bigint default 0)
+returns void
+language sql
+security definer
+set search_path = ''
+as $$
+  insert into public.members (group_id, user_id, role, credential, joined_epoch)
+  values (tests.gid(), tests.uid(p_alias), p_role, tests.cred(p_alias), p_joined_epoch)
+$$;
+
+-- Standard world:
+--   group tests.gid() at epoch 0
+--     olga -> owner, ada -> admin, mia -> member
+--   otto -> signed in, not a member
+--   nina -> signed in, will try to join
+create function tests.seed_world()
+returns void
+language plpgsql
+as $$
+begin
+  perform tests.mk_user('olga');
+  perform tests.mk_user('ada');
+  perform tests.mk_user('mia');
+  perform tests.mk_user('otto');
+  perform tests.mk_user('nina');
+  insert into public.groups (id) values (tests.gid());
+  perform tests.add('olga', 'owner');
+  perform tests.add('ada', 'admin');
+  perform tests.add('mia', 'member');
+end
+$$;
+
+-- Files a pending join request for p_alias using a fresh invite (as superuser).
+create function tests.mk_request(p_alias text, p_expires interval default interval '5 minutes')
+returns uuid
+language sql
+security definer
+set search_path = ''
+as $$
+  insert into public.join_requests (group_id, requester_id, credential, key_package, expires_at)
+  values (tests.gid(), tests.uid(p_alias), tests.cred(p_alias), 'S1A=', now() + p_expires)
+  returning id
+$$;
+
+create function tests.epoch()
+returns bigint
+language sql
+stable
+security definer
+set search_path = ''
+as $$ select g.epoch from public.groups g where g.id = tests.gid() $$;
+
+grant execute on all functions in schema tests to authenticated, anon;
+-- pgTAP assertions also run as the simulated user.
+grant execute on all functions in schema extensions to authenticated, anon;

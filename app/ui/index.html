@@ -27,6 +27,7 @@
       </div>
 
       <nav id="groups" class="groups" aria-label="Groups"></nav>
+      <div id="pending" class="pending" aria-live="polite"></div>
       <p id="groups-empty" class="empty">No groups yet. Create one, or paste an invite code from a friend.</p>
     </aside>
 
@@ -34,19 +35,19 @@
       <div id="chat-placeholder" class="placeholder">
         <span class="sigil large" aria-hidden="true"></span>
         <p>Select a group to start talking.</p>
-        <p class="hint">Messages are encrypted on this device. The server only ever sees ciphertext.</p>
+        <p class="hint">Messages are end-to-end encrypted with MLS. The server only ever sees ciphertext.</p>
       </div>
 
       <section id="chat-view" class="chat-view" hidden>
         <header class="chat-header">
           <button id="back" type="button" class="icon-btn back" aria-label="Back to groups">&larr;</button>
           <h2 id="chat-title"></h2>
+          <button id="show-members" type="button" class="btn small">Members</button>
           <button id="show-invite" type="button" class="btn small">Invite</button>
           <button id="leave" type="button" class="btn small danger">Leave</button>
         </header>
-        <div id="messages" class="messages" role="log" aria-live="polite">
-          <button id="load-older" type="button" class="btn small load-older" hidden>Load earlier messages</button>
-        </div>
+        <p id="removed-banner" class="removed-banner" hidden>You were removed from this group. New messages can't be decrypted on this device.</p>
+        <div id="messages" class="messages" role="log" aria-live="polite"></div>
         <form id="composer" class="composer" autocomplete="off">
           <textarea id="input" rows="1" placeholder="Write a message…" maxlength="8000" aria-label="Message"></textarea>
           <button type="submit" class="btn primary">Send</button>
@@ -63,6 +64,7 @@
       <p id="dialog-text" class="dialog-text"></p>
       <input id="dialog-input" autocomplete="off" spellcheck="false">
       <code id="dialog-code" class="invite-code"></code>
+      <div id="dialog-body"></div>
       <p id="dialog-error" class="error" role="alert"></p>
       <menu>
         <button value="cancel" type="button" id="dialog-cancel" class="btn">Cancel</button>

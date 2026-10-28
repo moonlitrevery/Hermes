@@ -1,13 +1,13 @@
-//! Minimal Supabase client: anonymous auth (GoTrue) and PostgREST.
-//!
-//! Supabase is treated as an untrusted relay. Everything that leaves this
-//! module is either ciphertext or a public identifier.
+//! Minimal Supabase client: anonymous auth (GoTrue), PostgREST reads and the
+//! Hermes RPCs. Supabase is treated as an untrusted relay: everything sent
+//! here is MLS ciphertext, a public key, or an opaque id.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::crypto::SealedMessage;
-use crate::{Error, Result, now_ms};
+use crate::{Error, Result, Role, now_ms};
 
 #[derive(Debug, Clone)]
 pub struct SupabaseConfig {
@@ -30,10 +30,7 @@ impl SupabaseConfig {
     }
 
     pub fn realtime_url(&self) -> String {
-        let ws = self
-            .url
-            .replacen("https://", "wss://", 1)
-            .replacen("http://", "ws://", 1);
+        let ws = self.url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
         format!("{ws}/realtime/v1/websocket?apikey={}&vsn=1.0.0", self.anon_key)
     }
 }
@@ -44,7 +41,7 @@ pub struct Session {
     pub refresh_token: String,
     /// Unix seconds.
     pub expires_at: i64,
-    pub user_id: String,
+    pub user_id: Uuid,
 }
 
 impl Session {
@@ -63,7 +60,7 @@ struct AuthResponse {
 
 #[derive(Deserialize)]
 struct AuthUser {
-    id: String,
+    id: Uuid,
 }
 
 impl From<AuthResponse> for Session {
@@ -77,17 +74,47 @@ impl From<AuthResponse> for Session {
     }
 }
 
-/// A message row as stored in `public.messages`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MessageRow {
     pub id: i64,
-    pub group_id: String,
-    #[serde(flatten)]
-    pub sealed: SealedMessage,
-    pub created_at: String,
+    pub epoch: i64,
+    pub kind: String,
+    pub sender_credential: String,
+    pub payload: String,
 }
 
-const MESSAGE_COLUMNS: &str = "id,group_id,sender_pub,nonce,ciphertext,signature,created_at";
+#[derive(Debug, Clone, Deserialize)]
+pub struct JoinRequestRow {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub requester_id: Uuid,
+    pub credential: String,
+    pub key_package: String,
+    pub status: String,
+    pub welcome: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepartureRow {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub credential: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberRow {
+    pub group_id: Uuid,
+    pub user_id: Uuid,
+    pub role: Role,
+    pub credential: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JoinReply {
+    pub status: String,
+    pub request_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
+}
 
 pub struct Supabase {
     cfg: SupabaseConfig,
@@ -98,6 +125,7 @@ impl Supabase {
     pub fn new(cfg: SupabaseConfig) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(concat!("hermes/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("HTTP client");
         Self { cfg, http }
@@ -136,7 +164,7 @@ impl Supabase {
             .bearer_auth(token)
     }
 
-    async fn rpc(&self, token: &str, name: &str, args: Value) -> Result<Value> {
+    pub async fn rpc<T: DeserializeOwned>(&self, token: &str, name: &str, args: Value) -> Result<T> {
         let res = self
             .rest(reqwest::Method::POST, &format!("rpc/{name}"), token)
             .json(&args)
@@ -145,86 +173,165 @@ impl Supabase {
         parse(res).await
     }
 
-    pub async fn create_group(&self, token: &str, group_id: &str, name_ct: &str, sign_pub: &str) -> Result<()> {
-        self.rpc(token, "create_group", json!({ "p_id": group_id, "p_name_ct": name_ct, "p_sign_pub": sign_pub }))
-            .await?;
-        Ok(())
-    }
-
-    /// Registers this user as a member and returns the group's sealed name.
-    pub async fn join_group(&self, token: &str, group_id: &str, sign_pub: &str) -> Result<String> {
-        let v = self
-            .rpc(token, "join_group", json!({ "p_id": group_id, "p_sign_pub": sign_pub }))
-            .await?;
-        v.as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| Error::Malformed("join_group response".into()))
-    }
-
-    pub async fn leave_group(&self, token: &str, group_id: &str, user_id: &str) -> Result<()> {
+    /// For RPCs returning void (HTTP 204, no body).
+    async fn rpc_unit(&self, token: &str, name: &str, args: Value) -> Result<()> {
         let res = self
-            .rest(reqwest::Method::DELETE, "members", token)
-            .query(&[("group_id", format!("eq.{group_id}")), ("user_id", format!("eq.{user_id}"))])
+            .rest(reqwest::Method::POST, &format!("rpc/{name}"), token)
+            .json(&args)
             .send()
             .await?;
-        check(res).await
+        if res.status().is_success() { Ok(()) } else { Err(api_error(res).await) }
     }
 
-    /// Newest-first page of messages, optionally strictly older than `before_id`.
-    pub async fn messages_before(&self, token: &str, group_id: &str, before_id: Option<i64>, limit: u32) -> Result<Vec<MessageRow>> {
-        let mut query = vec![
-            ("select", MESSAGE_COLUMNS.to_owned()),
-            ("group_id", format!("eq.{group_id}")),
-            ("order", "id.desc".to_owned()),
-            ("limit", limit.to_string()),
-        ];
-        if let Some(id) = before_id {
-            query.push(("id", format!("lt.{id}")));
-        }
-        let res = self.rest(reqwest::Method::GET, "messages", token).query(&query).send().await?;
+    async fn select<T: DeserializeOwned>(&self, token: &str, table: &str, query: &[(&str, String)]) -> Result<Vec<T>> {
+        let res = self.rest(reqwest::Method::GET, table, token).query(query).send().await?;
         parse(res).await
     }
 
-    /// Oldest-first messages strictly newer than `after_id`, used to fill gaps after reconnecting.
-    pub async fn messages_after(&self, token: &str, group_id: &str, after_id: i64, limit: u32) -> Result<Vec<MessageRow>> {
-        let query = [
-            ("select", MESSAGE_COLUMNS.to_owned()),
-            ("group_id", format!("eq.{group_id}")),
-            ("id", format!("gt.{after_id}")),
-            ("order", "id.asc".to_owned()),
-            ("limit", limit.to_string()),
-        ];
-        let res = self.rest(reqwest::Method::GET, "messages", token).query(&query).send().await?;
-        parse(res).await
+    // ---- RPCs ---------------------------------------------------------------
+
+    pub async fn claim_device(&self, token: &str, secret: &str) -> Result<()> {
+        self.rpc_unit(token, "claim_device", json!({ "p_secret": secret })).await
     }
 
-    pub async fn post_message(&self, token: &str, group_id: &str, sealed: &SealedMessage) -> Result<MessageRow> {
-        let res = self
-            .rest(reqwest::Method::POST, "messages", token)
-            .query(&[("select", MESSAGE_COLUMNS)])
-            .header("Prefer", "return=representation")
-            .json(&json!({
-                "group_id": group_id,
-                "sender_pub": sealed.sender_pub,
-                "nonce": sealed.nonce,
-                "ciphertext": sealed.ciphertext,
-                "signature": sealed.signature,
-            }))
-            .send()
+    pub async fn create_group(&self, token: &str, id: Uuid, credential: &str) -> Result<()> {
+        self.rpc_unit(token, "create_group", json!({ "p_id": id, "p_credential": credential })).await
+    }
+
+    /// Returns the expiry timestamp as reported by the server.
+    pub async fn create_invite(&self, token: &str, group_id: Uuid, code: &str) -> Result<String> {
+        self.rpc(token, "create_invite", json!({ "p_group_id": group_id, "p_code": code })).await
+    }
+
+    pub async fn request_join(&self, token: &str, code: &str, credential: &str, key_package: &str) -> Result<JoinReply> {
+        let mut rows: Vec<JoinReply> = self
+            .rpc(
+                token,
+                "request_join",
+                json!({ "p_code": code, "p_credential": credential, "p_key_package": key_package }),
+            )
             .await?;
-        let mut rows: Vec<MessageRow> = parse(res).await?;
-        rows.pop().ok_or_else(|| Error::Malformed("insert returned no row".into()))
+        rows.pop().ok_or_else(|| Error::Malformed("request_join returned nothing".into()))
+    }
+
+    pub async fn add_member(&self, token: &str, request_id: Uuid, epoch: i64, commit: &str, welcome: &str) -> Result<i64> {
+        self.rpc(
+            token,
+            "add_member",
+            json!({ "p_request_id": request_id, "p_epoch": epoch, "p_commit": commit, "p_welcome": welcome }),
+        )
+        .await
+    }
+
+    pub async fn remove_member(&self, token: &str, group_id: Uuid, user_id: Uuid, epoch: i64, commit: &str) -> Result<i64> {
+        self.rpc(
+            token,
+            "remove_member",
+            json!({ "p_group_id": group_id, "p_user_id": user_id, "p_epoch": epoch, "p_commit": commit }),
+        )
+        .await
+    }
+
+    pub async fn complete_departure(&self, token: &str, departure_id: Uuid, epoch: i64, commit: &str) -> Result<i64> {
+        self.rpc(
+            token,
+            "complete_departure",
+            json!({ "p_departure_id": departure_id, "p_epoch": epoch, "p_commit": commit }),
+        )
+        .await
+    }
+
+    pub async fn leave_group(&self, token: &str, group_id: Uuid) -> Result<()> {
+        self.rpc_unit(token, "leave_group", json!({ "p_group_id": group_id })).await
+    }
+
+    pub async fn set_role(&self, token: &str, group_id: Uuid, user_id: Uuid, role: Role) -> Result<()> {
+        self.rpc_unit(token, "set_role", json!({ "p_group_id": group_id, "p_user_id": user_id, "p_role": role })).await
+    }
+
+    pub async fn post_message(&self, token: &str, group_id: Uuid, epoch: i64, payload: &str) -> Result<i64> {
+        self.rpc(token, "post_message", json!({ "p_group_id": group_id, "p_epoch": epoch, "p_payload": payload }))
+            .await
+    }
+
+    // ---- reads ----------------------------------------------------------------
+
+    pub async fn messages_after(&self, token: &str, group_id: Uuid, after_id: i64, limit: u32) -> Result<Vec<MessageRow>> {
+        self.select(
+            token,
+            "messages",
+            &[
+                ("select", "id,epoch,kind,sender_credential,payload".into()),
+                ("group_id", format!("eq.{group_id}")),
+                ("id", format!("gt.{after_id}")),
+                ("order", "id.asc".into()),
+                ("limit", limit.to_string()),
+            ],
+        )
+        .await
+    }
+
+    pub async fn commit_at(&self, token: &str, group_id: Uuid, epoch: i64) -> Result<Option<MessageRow>> {
+        let mut rows = self
+            .select(
+                token,
+                "messages",
+                &[
+                    ("select", "id,epoch,kind,sender_credential,payload".into()),
+                    ("group_id", format!("eq.{group_id}")),
+                    ("kind", "eq.commit".into()),
+                    ("epoch", format!("eq.{epoch}")),
+                ],
+            )
+            .await?;
+        Ok(rows.pop())
+    }
+
+    pub async fn join_request(&self, token: &str, id: Uuid) -> Result<Option<JoinRequestRow>> {
+        let mut rows = self
+            .select(token, "join_requests", &[("select", "*".into()), ("id", format!("eq.{id}"))])
+            .await?;
+        Ok(rows.pop())
+    }
+
+    /// Pending requests visible to this user (as admin, or their own).
+    pub async fn pending_requests(&self, token: &str) -> Result<Vec<JoinRequestRow>> {
+        self.select(
+            token,
+            "join_requests",
+            &[("select", "*".into()), ("status", "eq.pending".into()), ("order", "created_at.asc".into())],
+        )
+        .await
+    }
+
+    pub async fn departures(&self, token: &str) -> Result<Vec<DepartureRow>> {
+        self.select(token, "departures", &[("select", "id,group_id,credential".into())]).await
+    }
+
+    pub async fn my_memberships(&self, token: &str, user_id: Uuid) -> Result<Vec<MemberRow>> {
+        self.select(
+            token,
+            "members",
+            &[("select", "group_id,user_id,role,credential".into()), ("user_id", format!("eq.{user_id}"))],
+        )
+        .await
+    }
+
+    pub async fn members(&self, token: &str, group_id: Uuid) -> Result<Vec<MemberRow>> {
+        self.select(
+            token,
+            "members",
+            &[
+                ("select", "group_id,user_id,role,credential".into()),
+                ("group_id", format!("eq.{group_id}")),
+                ("order", "joined_at.asc".into()),
+            ],
+        )
+        .await
     }
 }
 
-async fn check(res: reqwest::Response) -> Result<()> {
-    if res.status().is_success() {
-        return Ok(());
-    }
-    Err(api_error(res).await)
-}
-
-async fn parse<T: serde::de::DeserializeOwned>(res: reqwest::Response) -> Result<T> {
+async fn parse<T: DeserializeOwned>(res: reqwest::Response) -> Result<T> {
     if !res.status().is_success() {
         return Err(api_error(res).await);
     }

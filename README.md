@@ -2,65 +2,135 @@
 
 Hermes is a messaging app inspired by Ordem Carmesim, built for security and encryption.
 
-It has group chats only. One member creates a group and gets an **invite code**. Friends paste
-that code into Hermes to join. Messages are encrypted on the device before they leave it.
-[Supabase](https://supabase.com) only stores and relays ciphertext. You run no server of your own.
+It has group chats only. An admin generates a short invite code that works **once** and only
+for **5 minutes**. A friend types it into Hermes, and the admin's app lets them in automatically.
+Messages are encrypted with [MLS (RFC 9420)](https://www.rfc-editor.org/rfc/rfc9420) on the device.
+[Supabase](https://supabase.com) only stores and orders ciphertext; you run no server of your own.
 
 ## Layout
 
 ```
-crates/hermes-core/   Rust core: crypto, local storage, Supabase REST + Realtime client
-app/src-tauri/        Tauri 2 shell (desktop, Android, iOS) exposing the core as commands
+crates/hermes-core/   Rust core: MLS (openmls), keystore vault, Supabase REST + Realtime, sync
+  tests/              integration tests against a local Supabase stack
+app/src-tauri/        Tauri 2 shell (desktop; Android/iOS see below) exposing the core as commands
 app/ui/               Plain HTML/CSS/JS frontend (no bundler, no frameworks)
-supabase/migrations/  Database schema, row-level security and RPCs
+supabase/migrations/  schema, row-level security, RPCs and rate limits
+supabase/tests/       pgTAP tests
 ```
 
 ## Security model
 
-| Thing                   | What the server sees                         |
-|-------------------------|----------------------------------------------|
-| Message text            | Ciphertext only (XChaCha20-Poly1305)         |
-| Display names           | Nothing; they're inside the encrypted message|
-| Group names             | Ciphertext only                              |
-| Group identity          | `BLAKE3-derive(secret)`, not reversible      |
-| Who is in which group   | Anonymous user ids + Ed25519 public keys     |
-| When and how much       | Timestamps and ciphertext sizes              |
+### Groups are MLS groups
 
-- **Invite code** = base58(`version ‖ 32-byte group secret ‖ checksum`). It *is* the group
-  key, so anyone holding it can read the full history. Share it only over a channel you trust.
-- Every message is **signed** with the sender's Ed25519 device key and checked before display.
-  Members can't impersonate each other, and the server can't forge or alter messages.
-  Each sender's key fingerprint is shown next to their name.
-- Row-level security only lets members read a group. A message can only be posted with the
-  signing key the poster registered for that group. Messages can't be edited or deleted.
-  When the last member leaves, the group and all its ciphertext are deleted.
+- Ciphersuite `MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519`, via `openmls`.
+- Every message is an MLS PrivateMessage, and so is every commit. The server can't see
+  message content, and it can't see who a commit adds or removes.
+- Every device has one Ed25519 signature key. It is the device's MLS credential, and members
+  see its fingerprint next to each sender's name.
+- The group name lives in an encrypted GroupContext extension, so a new member gets it inside
+  the Welcome.
 
-**Known limitations (v0.1)**
+### Invites carry no keys
 
-- One static key per group: no forward secrecy, and removing someone means making a new group.
-  The next step would be [MLS](https://www.rfc-editor.org/rfc/rfc9420) via `openmls`.
-- Local state (`hermes.json` in the app data dir) holds the identity key and invite secrets.
-  It's readable only by the owner (mode 0600) but **not encrypted at rest**. Moving it into the
-  OS keystore (Android Keystore, iOS Keychain, Secret Service) is planned.
-- Supabase still sees metadata: which anonymous users are in which group, and when they post.
-- Text messages only, with no attachments yet.
+- Only admins (and the owner) can create codes. A code is 16 Crockford base32 characters
+  (80 random bits), shown as `XXXX-XXXX-XXXX-XXXX`.
+- The server stores only `SHA-256(code)`. A code expires after 5 minutes and is consumed by the
+  first valid use. Wrong, used and expired codes all get the same answer.
+- Using a code files a join request carrying the joiner's KeyPackage. Any online admin's app
+  validates it (including that its identity matches the request) and commits an MLS Add. The
+  Welcome is stored together with the new membership, in one transaction. An admin can only
+  accept a request while its code is still valid.
+
+### What membership means
+
+| | |
+|---|---|
+| Joining | You can read from your join epoch on. Older messages are hidden by RLS, and MLS never gave you their keys anyway. |
+| Removal | An MLS Remove commit. The removed device can't decrypt anything sent afterwards, and the server stops serving it the group. |
+| Leaving | The server stops serving you at once. An admin's app then commits the MLS Remove for your leaf. |
+| Roles | **Owner** (exactly one, can't be removed, promotes and demotes). **Admin** creates codes and removes members. **Member** chats. Only the owner can remove an admin. |
+
+### The server orders epochs
+
+`groups.epoch` is the MLS epoch. A commit is accepted only for the group's *current* epoch, and
+the epoch then advances. This is enforced under a row lock and by a unique index (one commit per
+epoch), so two concurrent commits for the same epoch can't both be accepted. Application messages
+also have to be for the current epoch, and clients apply rows in id order. If a client loses that
+race, it fetches the newer commits and retries.
+
+### Keys on the device
+
+All local state is one file, `state.hermes`, encrypted with XChaCha20-Poly1305. It holds the
+identity key, MLS group secrets, session, device secret and message history. The 32-byte key for
+that file exists only in the OS keystore, accessed through the `keyring` crate: Secret Service on
+Linux, Credential Manager on Windows, Keychain on macOS. If no keystore is available, Hermes
+refuses to start rather than write secrets in clear. The v0.1 plaintext `hermes.json` is deleted
+when the app opens.
+
+### Lost anonymous sessions
+
+Each device registers `SHA-256(device secret)` with the server. If its anonymous session is lost,
+the app signs in as a new anonymous user and presents the secret. The server then moves the
+device's memberships and pending join requests to the new user and deletes the abandoned
+anonymous user, so no ghost member stays behind. The MLS leaf doesn't change.
+
+### Abuse
+
+The anon key ships inside the binary, so assume anyone can call the API. Limits are enforced
+in the database, per user:
+
+| Action | Limit |
+|---|---|
+| create a group | 10 / hour |
+| create an invite code | 20 / hour |
+| request to join (*every attempt counts, including wrong codes*) | 10 / hour |
+| send a message | 60 / minute |
+| claim a device | 10 / hour |
+
+Because anonymous users are cheap, **turn on CAPTCHA for sign-ins** in the hosted project:
+
+1. Create an hCaptcha or Cloudflare Turnstile site and get its site key and secret.
+2. Dashboard → Authentication → Attack Protection → **Enable CAPTCHA protection**, pick the
+   provider and paste the secret.
+3. The client must then send `gotrue_meta_security.captcha_token` with the anonymous sign-up
+   (`POST /auth/v1/signup`). Hermes doesn't do this yet: the widget needs a page that can run the
+   provider's script. Until then, keep CAPTCHA off and rely on the per-IP limit below.
+4. Keep Authentication → Rate Limits → *anonymous sign-ins* at the default (30/hour per IP) or
+   lower.
+
+### What the server still sees
+
+- which anonymous users are in which group, and their roles
+- when each member posts, how much, and when commits happen
+- each device's public signature key
+
+### Known limitations
+
+- **Android and iOS:** the `keyring` v1 API used here covers desktop only. On mobile Hermes
+  refuses to open (it never falls back to plaintext) until the Android Keystore and iOS Keychain
+  stores are wired in through `keyring-core`. That code hasn't been written or tested.
+- History lives only on devices (MLS deletes keys after use). A new device starts empty.
+- Members don't post self-updates, so post-compromise security only advances when an admin
+  commits (adds or removes).
+- Roles are enforced by the server, not checked by clients against MLS state. A malicious server
+  could let a non-admin commit, but it still can't read or forge messages.
+- Text messages only, with no attachments.
 
 ## Setup
 
-### 1. Supabase
+### 1. Supabase project
 
 1. Create a project.
-2. **Authentication → Sign In / Providers → enable "Allow anonymous sign-ins".**
-   Turning on CAPTCHA and keeping the default rate limits is recommended.
-3. Run the migration, either with the CLI (`supabase link && supabase db push`) or by pasting
-   `supabase/migrations/20261028000000_hermes_init.sql` into the SQL editor.
+2. Authentication → Sign In / Providers → enable **Allow anonymous sign-ins**.
+3. Apply the migrations: `pnpm exec supabase link && pnpm exec supabase db push`.
 4. Copy the project URL and the **anon / publishable** key from Project Settings → API.
-   Never ship the `service_role` key in the app.
+   Never ship the `service_role` key.
 
 ### 2. Build
 
-Prerequisites: Rust (stable), Node + pnpm, and the
-[Tauri 2 system dependencies](https://v2.tauri.app/start/prerequisites/).
+Prerequisites: Rust (stable), Node and pnpm, and the
+[Tauri 2 system dependencies](https://v2.tauri.app/start/prerequisites/). On Linux a Secret
+Service provider (GNOME Keyring or KWallet) must be running.
 
 ```sh
 export HERMES_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
@@ -72,14 +142,14 @@ pnpm tauri dev        # desktop, hot reload
 pnpm tauri build      # desktop installers
 ```
 
-The two variables are compiled into the binary (required on mobile, where there is no shell
-environment). On desktop they can also be supplied at runtime.
+The two variables are compiled into the binary. On desktop they can also be given at runtime.
 
-**Mobile:** `pnpm tauri android init && pnpm tauri android dev`, or `ios init` / `ios dev` on a
-Mac. Android needs the SDK and NDK, and TLS (`aws-lc-rs`) also needs `cmake` on the build machine.
-
-### Tests
+## Tests
 
 ```sh
-cargo test -p hermes-core
+pnpm install                 # Supabase CLI
+cargo test -p hermes-core    # unit tests (MLS, vault, invite codes); integration tests show as ignored
+pnpm db:start                # local stack on ports 553xx (separate from other projects)
+pnpm test:db                 # pgTAP: every policy and RPC, plus meta tests
+pnpm test:e2e                # Rust integration tests with real clients against the local stack
 ```

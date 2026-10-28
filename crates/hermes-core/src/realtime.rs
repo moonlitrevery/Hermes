@@ -1,9 +1,8 @@
-//! Supabase Realtime (Phoenix channels, protocol vsn 1.0.0) subscription to
-//! new rows in `public.messages`.
+//! Supabase Realtime (Phoenix channels, protocol vsn 1.0.0) used as a doorbell.
 //!
-//! No filter is sent: Realtime applies row-level security per subscriber, so
-//! the server only forwards rows from groups this user is a member of, and
-//! groups joined later are picked up without resubscribing.
+//! Notifications only say "something changed"; the client then fetches through
+//! the REST API, which is the single source of truth. Realtime applies row
+//! level security per subscriber, so it only rings for rows this user may read.
 
 use std::future::Future;
 use std::time::Duration;
@@ -13,18 +12,17 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::supabase::MessageRow;
 use crate::{Error, Result};
 
-const TOPIC: &str = "realtime:hermes-messages";
+const TOPIC: &str = "realtime:hermes";
 const HEARTBEAT: Duration = Duration::from_secs(25);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum RealtimeEvent {
-    /// Subscribed; anything that arrived while offline must be fetched separately.
+    /// Subscribed; anything that changed while offline must be fetched.
     Connected,
-    Insert(MessageRow),
+    Changed,
     Disconnected(String),
 }
 
@@ -79,7 +77,11 @@ where
             "config": {
                 "broadcast": { "self": false },
                 "presence": { "key": "" },
-                "postgres_changes": [{ "event": "INSERT", "schema": "public", "table": "messages" }],
+                "postgres_changes": [
+                    { "event": "INSERT", "schema": "public", "table": "messages" },
+                    { "event": "*", "schema": "public", "table": "join_requests" },
+                    { "event": "INSERT", "schema": "public", "table": "departures" },
+                ],
             },
             "access_token": access_token,
         }),
@@ -122,30 +124,28 @@ where
                 let Ok(v) = serde_json::from_str::<Value>(text) else { continue };
                 let event = v["event"].as_str().unwrap_or_default();
                 let payload = &v["payload"];
-                match (v["topic"].as_str().unwrap_or_default(), event) {
-                    ("phoenix", "phx_reply") => awaiting_reply = false,
+                let out = match (v["topic"].as_str().unwrap_or_default(), event) {
+                    ("phoenix", "phx_reply") => {
+                        awaiting_reply = false;
+                        None
+                    }
                     (TOPIC, "phx_reply") => {
                         if payload["status"] != "ok" {
                             return Err(Error::Realtime(format!("subscription rejected: {}", payload["response"])));
                         }
-                        if !payload["response"]["postgres_changes"].is_null() && tx.send(RealtimeEvent::Connected).await.is_err() {
-                            return Ok(());
-                        }
+                        (!payload["response"]["postgres_changes"].is_null()).then_some(RealtimeEvent::Connected)
                     }
-                    (TOPIC, "postgres_changes") => {
-                        let record = &payload["data"]["record"];
-                        match serde_json::from_value::<MessageRow>(record.clone()) {
-                            Ok(row) => if tx.send(RealtimeEvent::Insert(row)).await.is_err() { return Ok(()) },
-                            Err(e) => tracing::warn!("ignoring malformed realtime record: {e}"),
-                        }
-                    }
+                    (TOPIC, "postgres_changes") => Some(RealtimeEvent::Changed),
                     (TOPIC, "system") if payload["status"] == "error" => {
                         return Err(Error::Realtime(format!("{}", payload["message"])));
                     }
                     (TOPIC, "phx_error" | "phx_close") => {
                         return Err(Error::Realtime(format!("channel {event}")));
                     }
-                    _ => {}
+                    _ => None,
+                };
+                if let Some(e) = out && tx.send(e).await.is_err() {
+                    return Ok(());
                 }
             }
         }

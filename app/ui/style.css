@@ -142,7 +142,6 @@ button, input, textarea { font: inherit; color: inherit; }
   display: flex; flex-direction: column; gap: 6px;
   padding: 16px;
 }
-.load-older { align-self: center; margin-bottom: 8px; }
 
 .msg {
   max-width: min(75%, 560px);
@@ -220,3 +219,38 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; margin: 16px 0
   .msg { max-width: 85%; }
 }
 .day { align-self: center; margin: 8px 0; }
+
+/* Roles, pending joins, members */
+.tag {
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.group.removed .group-name { color: var(--muted); text-decoration: line-through; }
+.pending { display: flex; flex-direction: column; gap: 4px; }
+.pending-item {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px dashed var(--crimson);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.removed-banner {
+  margin: 0;
+  padding: 10px 16px;
+  background: var(--bubble-mine);
+  font-size: 13px;
+}
+.countdown { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+.members { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow-y: auto; }
+.member {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.member-who { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.member-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

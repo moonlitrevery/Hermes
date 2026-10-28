@@ -1,48 +1,67 @@
-//! Hermes core: end-to-end encrypted group chat that uses Supabase only as an
-//! untrusted relay for ciphertext.
+//! Hermes core: MLS (RFC 9420) group chat that uses Supabase only as an
+//! untrusted, ordering relay for ciphertext.
+//!
+//! Flow in short:
+//! - The owner creates an MLS group locally and registers its id.
+//! - An admin generates a 5-minute, single-use invite code (random, no key
+//!   material). The server keeps only its hash.
+//! - A joiner trades the code for a join request carrying a KeyPackage. Any
+//!   online admin's app then commits an Add and posts the Welcome; the joiner
+//!   enters at that epoch and can't read anything older.
+//! - Removing a member commits an MLS Remove, so they can't read anything new.
+//! - The server accepts a commit only for the group's current epoch, which
+//!   totally orders commits; clients process server rows in id order.
 
-pub mod crypto;
+pub mod mls;
 pub mod realtime;
 mod store;
 pub mod supabase;
+pub mod vault;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 
-use serde::Serialize;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+use openmls::group::MlsGroup;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use uuid::Uuid;
 
-use crate::crypto::{GroupSecret, Identity, MessageBody, fingerprint, open_message, random_bytes, seal_message};
+use crate::mls::{Device, Incoming, Provider, epoch};
 use crate::realtime::RealtimeEvent;
-use crate::store::{State, StoredGroup};
-use crate::supabase::{MessageRow, Session, Supabase, SupabaseConfig};
+use crate::store::{GroupState, PendingJoin, State};
+use crate::supabase::{JoinRequestRow, MessageRow, Session, Supabase, SupabaseConfig};
+pub use crate::vault::{KeyVault, MemoryVault, SystemKeyring};
 
 pub const MAX_NAME_CHARS: usize = 64;
 pub const MAX_MESSAGE_CHARS: usize = 8_000;
-const PAGE_SIZE: u32 = 50;
+/// Invites live 5 minutes on the server; the joiner waits a little longer for clock skew.
+const JOIN_WAIT_MS: i64 = 5 * 60 * 1000 + 30_000;
+/// Fallback sync for anything Realtime missed (and for noticing removals).
+const SYNC_INTERVAL: Duration = Duration::from_secs(15);
+const PAGE: u32 = 200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("That invite code is not valid. Check it for typos.")]
+    #[error("That invite code is invalid, already used, or expired.")]
     InvalidInvite,
-    #[error("message could not be decrypted")]
-    Decrypt,
-    #[error("message signature is invalid")]
-    BadSignature,
     #[error("malformed data: {0}")]
     Malformed(String),
     #[error("Supabase is not configured: set HERMES_SUPABASE_URL and HERMES_SUPABASE_ANON_KEY")]
     NotConfigured,
-    #[error("You are already in this group.")]
-    AlreadyJoined,
-    #[error("unknown group")]
-    UnknownGroup,
     #[error("{0}")]
     Invalid(String),
+    #[error("unknown group")]
+    UnknownGroup,
+    #[error("MLS: {0}")]
+    Mls(String),
+    #[error("secure storage: {0}")]
+    Keystore(String),
     #[error("network error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("server error ({status}): {message}")]
+    #[error("{message}")]
     Api { status: u16, message: String },
     #[error("realtime: {0}")]
     Realtime(String),
@@ -50,6 +69,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("storage error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl Error {
+    fn is_epoch_conflict(&self) -> bool {
+        matches!(self, Error::Api { status: 409, message } if message.contains("epoch"))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -61,6 +86,74 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
+pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    getrandom::fill(&mut buf).expect("OS random number generator unavailable");
+    buf
+}
+
+/// Short human-comparable fingerprint of a credential, e.g. `3f9a-c1d0-77be-0442`.
+pub fn fingerprint(credential_hex: &str) -> String {
+    let hex = hex::encode(&blake3::hash(credential_hex.as_bytes()).as_bytes()[..8]);
+    hex.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
+}
+
+// ---- invite codes -------------------------------------------------------------
+
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// 16 Crockford base32 characters = 80 random bits. Carries no key material.
+pub fn generate_invite_code() -> String {
+    let bytes = random_bytes::<10>();
+    let mut bits = 0u32;
+    let mut acc = 0u32;
+    let mut out = String::with_capacity(16);
+    for b in bytes {
+        acc = (acc << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(CROCKFORD[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Accepts what people type: any case, dashes or spaces, and the usual
+/// Crockford look-alikes (O for 0, I/L for 1).
+pub fn normalize_invite_code(input: &str) -> Option<String> {
+    let code: String = input
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        })
+        .collect();
+    (code.len() == 16 && code.bytes().all(|b| CROCKFORD.contains(&b))).then_some(code)
+}
+
+pub fn format_invite_code(code: &str) -> String {
+    code.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-")
+}
+
+// ---- public types ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Owner,
+    Admin,
+    Member,
+}
+
+impl Role {
+    pub fn is_admin(self) -> bool {
+        matches!(self, Role::Owner | Role::Admin)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Profile {
     pub display_name: String,
@@ -70,138 +163,204 @@ pub struct Profile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupInfo {
-    pub id: String,
+    pub id: Uuid,
     pub name: String,
-    pub invite: String,
+    pub role: Role,
+    pub removed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct Invite {
+    pub code: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemberInfo {
+    pub user_id: Uuid,
+    pub role: Role,
+    pub name: Option<String>,
+    pub fingerprint: String,
+    pub me: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub id: i64,
-    pub group_id: String,
+    /// Random id chosen by the sender, inside the ciphertext; used to dedupe.
+    pub id: String,
+    pub group_id: Uuid,
     pub sender_name: String,
+    pub sender_credential: String,
     pub sender_fingerprint: String,
     pub mine: bool,
     pub text: String,
     pub sent_at: i64,
-    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HermesEvent {
     Message { message: ChatMessage },
+    /// Groups were joined, removed, or changed role; reload the list.
+    GroupsChanged,
+    JoinFailed { reason: String },
     Online,
     Offline { reason: String },
 }
 
+/// Plaintext of an application message.
+#[derive(Serialize, Deserialize)]
+struct Body {
+    v: u8,
+    id: String,
+    name: String,
+    text: String,
+    sent_at: i64,
+}
+
+struct Inner {
+    state: State,
+    device: Device,
+}
+
+impl Inner {
+    fn group_mut(&mut self, id: Uuid) -> Result<&mut GroupState> {
+        self.state.groups.iter_mut().find(|g| g.id == id).ok_or(Error::UnknownGroup)
+    }
+
+    fn load_group(&self, id: Uuid) -> Result<MlsGroup> {
+        self.device.load_group(id.as_bytes())?.ok_or(Error::UnknownGroup)
+    }
+
+    fn my_user_id(&self) -> Option<Uuid> {
+        self.state.session.as_ref().map(|s| s.user_id)
+    }
+}
+
 pub struct Hermes {
     path: PathBuf,
-    state: Mutex<State>,
-    identity: Identity,
+    key: [u8; 32],
     sb: Option<Supabase>,
-    /// Serialises sign-in/refresh so concurrent calls don't create two users.
-    auth: AsyncMutex<()>,
-    /// Highest message id seen per group, for gap-filling after reconnects.
-    last_seen: Mutex<HashMap<String, i64>>,
+    /// One lock for state, MLS and the session: MLS operations on a group
+    /// must never interleave.
+    inner: AsyncMutex<Inner>,
 }
 
 impl Hermes {
-    /// Loads (or creates) local state in `data_dir`.
-    pub fn open(data_dir: PathBuf, cfg: Option<SupabaseConfig>) -> Result<Arc<Self>> {
-        let path = data_dir.join("hermes.json");
-        let state = match store::load(&path)? {
-            Some(s) => s,
+    /// Opens (or creates) the encrypted profile in `data_dir`. The state key is
+    /// fetched from (or created in) `vault`.
+    pub fn open(data_dir: PathBuf, cfg: Option<SupabaseConfig>, vault: &dyn KeyVault) -> Result<Arc<Self>> {
+        // v0.1 kept its keys in a plaintext file; they are useless under MLS.
+        let legacy = data_dir.join("hermes.json");
+        if legacy.exists() {
+            std::fs::remove_file(legacy)?;
+        }
+
+        let path = data_dir.join("state.hermes");
+        let key = vault::master_key(vault, path.exists())?;
+        let (state, device) = match store::load(&path, &key)? {
+            Some(state) => {
+                let provider = Provider::import(store::decode_mls(&state.mls));
+                let public = hex::decode(&state.identity).map_err(|_| Error::Malformed("identity".into()))?;
+                let device = Device::load(provider, &public)?;
+                (state, device)
+            }
             None => {
-                let s = State::new(Identity::generate().secret_hex());
-                store::save(&path, &s)?;
-                s
+                let device = Device::generate()?;
+                let state = State {
+                    version: 2,
+                    identity: device.credential_hex(),
+                    device_secret: hex::encode(random_bytes::<32>()),
+                    display_name: String::new(),
+                    session: None,
+                    groups: Vec::new(),
+                    pending_joins: Vec::new(),
+                    mls: Vec::new(),
+                };
+                (state, device)
             }
         };
-        let identity = Identity::from_hex(&state.identity)?;
-        Ok(Arc::new(Self {
-            path,
-            state: Mutex::new(state),
-            identity,
-            sb: cfg.map(Supabase::new),
-            auth: AsyncMutex::new(()),
-            last_seen: Mutex::new(HashMap::new()),
-        }))
+        let hermes = Self { path, key, sb: cfg.map(Supabase::new), inner: AsyncMutex::new(Inner { state, device }) };
+        hermes.save(&mut hermes.inner.try_lock().expect("fresh lock"))?;
+        Ok(Arc::new(hermes))
     }
 
     fn sb(&self) -> Result<&Supabase> {
         self.sb.as_ref().ok_or(Error::NotConfigured)
     }
 
-    fn update_state<T>(&self, f: impl FnOnce(&mut State) -> T) -> Result<T> {
-        let mut state = self.state.lock().unwrap();
-        let out = f(&mut state);
-        store::save(&self.path, &state)?;
-        Ok(out)
+    fn save(&self, inner: &mut Inner) -> Result<()> {
+        inner.state.mls = store::encode_mls(inner.device.provider.export());
+        store::save(&self.path, &self.key, &inner.state)
     }
 
-    pub fn profile(&self) -> Profile {
+    // ---- session ----------------------------------------------------------------
+
+    pub async fn access_token(&self) -> Result<String> {
+        let mut inner = self.inner.lock().await;
+        self.token(&mut inner).await
+    }
+
+    async fn token(&self, inner: &mut Inner) -> Result<String> {
+        let sb = self.sb()?;
+        let session = match inner.state.session.clone() {
+            Some(s) if !s.needs_refresh() => return Ok(s.access_token),
+            Some(s) => match sb.refresh(&s).await {
+                Ok(fresh) => fresh,
+                // Refresh token rejected (expired or revoked): the anonymous
+                // user is gone, so start a new one and reclaim the device.
+                Err(Error::Api { status: 400..=499, .. }) => self.new_user(sb, inner).await?,
+                Err(e) => return Err(e),
+            },
+            None => self.new_user(sb, inner).await?,
+        };
+        let token = session.access_token.clone();
+        inner.state.session = Some(session);
+        self.save(inner)?;
+        Ok(token)
+    }
+
+    /// Signs in as a fresh anonymous user and claims this device: the server
+    /// moves the old user's memberships and pending requests here and deletes
+    /// the abandoned user, so the group never shows a ghost member.
+    async fn new_user(&self, sb: &Supabase, inner: &Inner) -> Result<Session> {
+        let session = sb.sign_in_anonymously().await?;
+        sb.claim_device(&session.access_token, &inner.state.device_secret).await?;
+        Ok(session)
+    }
+
+    // ---- profile and groups -----------------------------------------------------
+
+    pub async fn profile(&self) -> Profile {
+        let inner = self.inner.lock().await;
         Profile {
-            display_name: self.state.lock().unwrap().display_name.clone(),
-            fingerprint: fingerprint(&self.identity.public_hex()),
+            display_name: inner.state.display_name.clone(),
+            fingerprint: fingerprint(&inner.state.identity),
             configured: self.sb.is_some(),
         }
     }
 
-    pub fn set_display_name(&self, name: &str) -> Result<Profile> {
+    pub async fn set_display_name(&self, name: &str) -> Result<Profile> {
         let name = name.trim();
         if name.is_empty() || name.chars().count() > MAX_NAME_CHARS {
             return Err(Error::Invalid(format!("Name must be 1–{MAX_NAME_CHARS} characters.")));
         }
-        self.update_state(|s| s.display_name = name.to_owned())?;
-        Ok(self.profile())
-    }
-
-    pub fn groups(&self) -> Vec<GroupInfo> {
-        self.state.lock().unwrap().groups.iter().map(StoredGroup::info).collect()
-    }
-
-    fn group_secret(&self, group_id: &str) -> Result<GroupSecret> {
-        let state = self.state.lock().unwrap();
-        let g = state.groups.iter().find(|g| g.id == group_id).ok_or(Error::UnknownGroup)?;
-        GroupSecret::from_invite_code(&g.invite)
-    }
-
-    /// Returns a valid access token, signing in anonymously when there is no
-    /// usable session. A brand-new anonymous user has no memberships, so every
-    /// locally known group is re-joined with its stored secret.
-    pub async fn access_token(&self) -> Result<String> {
-        let sb = self.sb()?;
-        let _guard = self.auth.lock().await;
-        let current = self.state.lock().unwrap().session.clone();
-        let session = match current {
-            Some(s) if !s.needs_refresh() => return Ok(s.access_token),
-            Some(s) => match sb.refresh(&s).await {
-                Ok(fresh) => fresh,
-                // Refresh token rejected (expired or revoked): start over as a new user.
-                Err(Error::Api { status: 400..=499, .. }) => self.new_user(sb).await?,
-                Err(e) => return Err(e),
-            },
-            None => self.new_user(sb).await?,
-        };
-        let token = session.access_token.clone();
-        self.update_state(|s| s.session = Some(session))?;
-        Ok(token)
-    }
-
-    async fn new_user(&self, sb: &Supabase) -> Result<Session> {
-        let session = sb.sign_in_anonymously().await?;
-        let groups = self.groups();
-        for g in groups {
-            match sb.join_group(&session.access_token, &g.id, &self.identity.public_hex()).await {
-                Ok(_) => {}
-                Err(Error::Api { status, message }) => {
-                    tracing::warn!("could not rejoin group {}: {status} {message}", g.id)
-                }
-                Err(e) => return Err(e),
-            }
+        {
+            let mut inner = self.inner.lock().await;
+            inner.state.display_name = name.to_owned();
+            self.save(&mut inner)?;
         }
-        Ok(session)
+        Ok(self.profile().await)
+    }
+
+    pub async fn groups(&self) -> Vec<GroupInfo> {
+        let inner = self.inner.lock().await;
+        inner.state.groups.iter().map(group_info).collect()
+    }
+
+    pub async fn messages(&self, group_id: Uuid) -> Result<Vec<ChatMessage>> {
+        let mut inner = self.inner.lock().await;
+        Ok(inner.group_mut(group_id)?.messages.clone())
     }
 
     pub async fn create_group(&self, name: &str) -> Result<GroupInfo> {
@@ -209,56 +368,169 @@ impl Hermes {
         if name.is_empty() || name.chars().count() > MAX_NAME_CHARS {
             return Err(Error::Invalid(format!("Group name must be 1–{MAX_NAME_CHARS} characters.")));
         }
-        let secret = GroupSecret::generate();
-        let token = self.access_token().await?;
-        self.sb()?
-            .create_group(&token, &secret.group_id(), &secret.seal_name(name), &self.identity.public_hex())
-            .await?;
-        self.remember_group(&secret, name)
-    }
-
-    pub async fn join_group(&self, invite: &str) -> Result<GroupInfo> {
-        let secret = GroupSecret::from_invite_code(invite)?;
-        if self.group_secret(&secret.group_id()).is_ok() {
-            return Err(Error::AlreadyJoined);
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        let id = Uuid::new_v4();
+        let mut group = inner.device.create_group(id.as_bytes(), name)?;
+        if let Err(e) = self.sb()?.create_group(&token, id, &inner.device.credential_hex()).await {
+            inner.device.delete_group(&mut group)?;
+            return Err(e);
         }
-        let token = self.access_token().await?;
-        let sealed_name = match self.sb()?.join_group(&token, &secret.group_id(), &self.identity.public_hex()).await {
-            Err(Error::Api { status: 404 | 400, message }) if message.contains("group not found") => {
-                return Err(Error::Invalid("No group exists for that invite code.".into()));
-            }
-            r => r?,
+        let gs = GroupState {
+            id,
+            name: name.to_owned(),
+            role: Role::Owner,
+            last_id: 0,
+            removed: false,
+            messages: Vec::new(),
+            names: Default::default(),
         };
-        let name = secret.open_name(&sealed_name)?;
-        self.remember_group(&secret, &name)
-    }
-
-    fn remember_group(&self, secret: &GroupSecret, name: &str) -> Result<GroupInfo> {
-        let stored = StoredGroup { id: secret.group_id(), name: name.to_owned(), invite: secret.invite_code() };
-        let info = stored.info();
-        self.update_state(|s| s.groups.push(stored))?;
+        let info = group_info(&gs);
+        inner.state.groups.push(gs);
+        self.save(&mut inner)?;
         Ok(info)
     }
 
-    pub async fn leave_group(&self, group_id: &str) -> Result<()> {
-        let token = self.access_token().await?;
-        let user_id = self.state.lock().unwrap().session.as_ref().map(|s| s.user_id.clone()).unwrap_or_default();
-        self.sb()?.leave_group(&token, group_id, &user_id).await?;
-        self.update_state(|s| s.groups.retain(|g| g.id != group_id))?;
-        self.last_seen.lock().unwrap().remove(group_id);
+    /// Admins only. The code is valid for 5 minutes and a single use.
+    pub async fn create_invite(&self, group_id: Uuid) -> Result<Invite> {
+        let mut inner = self.inner.lock().await;
+        if !inner.group_mut(group_id)?.role.is_admin() {
+            return Err(Error::Invalid("Only group admins can create invite codes.".into()));
+        }
+        let token = self.token(&mut inner).await?;
+        let code = generate_invite_code();
+        let expires_at = self.sb()?.create_invite(&token, group_id, &code).await?;
+        Ok(Invite { code: format_invite_code(&code), expires_at })
+    }
+
+    /// Files a join request. Returns the group id; the group appears (with a
+    /// `GroupsChanged` event) once an online admin accepts it.
+    pub async fn join(&self, code: &str) -> Result<Uuid> {
+        let code = normalize_invite_code(code).ok_or(Error::InvalidInvite)?;
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        let key_package = B64.encode(inner.device.key_package()?);
+        let reply = self
+            .sb()?
+            .request_join(&token, &code, &inner.device.credential_hex(), &key_package)
+            .await?;
+        // The KeyPackage's private keys were just stored; keep them.
+        self.save(&mut inner)?;
+        match (reply.status.as_str(), reply.request_id, reply.group_id) {
+            ("ok", Some(request_id), Some(group_id)) => {
+                inner.state.pending_joins.push(PendingJoin { request_id, group_id, deadline: now_ms() + JOIN_WAIT_MS });
+                self.save(&mut inner)?;
+                Ok(group_id)
+            }
+            ("already_member", ..) => Err(Error::Invalid("You are already in this group.".into())),
+            _ => Err(Error::InvalidInvite),
+        }
+    }
+
+    pub async fn pending_joins(&self) -> Vec<Uuid> {
+        self.inner.lock().await.state.pending_joins.iter().map(|p| p.group_id).collect()
+    }
+
+    pub async fn members(&self, group_id: Uuid) -> Result<Vec<MemberInfo>> {
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        let rows = self.sb()?.members(&token, group_id).await?;
+        let mine = inner.device.credential_hex();
+        let my_name = inner.state.display_name.clone();
+        let gs = inner.group_mut(group_id)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MemberInfo {
+                user_id: r.user_id,
+                role: r.role,
+                me: r.credential == mine,
+                name: if r.credential == mine { Some(my_name.clone()) } else { gs.names.get(&r.credential).cloned() },
+                fingerprint: fingerprint(&r.credential),
+            })
+            .collect())
+    }
+
+    /// Only the owner promotes or demotes (enforced by the server).
+    pub async fn set_role(&self, group_id: Uuid, user_id: Uuid, role: Role) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        self.sb()?.set_role(&token, group_id, user_id, role).await
+    }
+
+    /// Commits an MLS Remove: the removed member can't decrypt anything sent
+    /// afterwards, and the server stops serving them the group.
+    pub async fn remove_member(&self, group_id: Uuid, user_id: Uuid) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        let sb = self.sb()?;
+        let target = sb
+            .members(&token, group_id)
+            .await?
+            .into_iter()
+            .find(|m| m.user_id == user_id)
+            .ok_or_else(|| Error::Invalid("That person is not in the group.".into()))?;
+
+        let mut events = Vec::new();
+        for attempt in 0..2 {
+            self.sync_group(&mut inner, &token, group_id, &mut events).await?;
+            let mut group = inner.load_group(group_id)?;
+            let commit = inner.device.remove_member(&mut group, &target.credential)?;
+            match sb.remove_member(&token, group_id, user_id, epoch(&group), &B64.encode(commit)).await {
+                Ok(_) => {
+                    inner.device.merge_pending_commit(&mut group)?;
+                    break;
+                }
+                Err(e) if e.is_epoch_conflict() && attempt == 0 => inner.device.clear_pending_commit(&mut group)?,
+                Err(e @ Error::Api { .. }) => {
+                    inner.device.clear_pending_commit(&mut group)?;
+                    self.save(&mut inner)?;
+                    return Err(e);
+                }
+                Err(e) => {
+                    // Unknown outcome: keep the pending commit; the next sync
+                    // merges or drops it depending on what the server stored.
+                    self.save(&mut inner)?;
+                    return Err(e);
+                }
+            }
+        }
+        self.save(&mut inner)
+    }
+
+    /// Leaves right away (the server stops serving the group); an admin's app
+    /// then commits the MLS removal. The owner can only leave an empty group.
+    pub async fn leave_group(&self, group_id: Uuid) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let removed = inner.group_mut(group_id)?.removed;
+        if !removed {
+            let token = self.token(&mut inner).await?;
+            match self.sb()?.leave_group(&token, group_id).await {
+                Ok(()) | Err(Error::Api { status: 404, .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.forget(&mut inner, group_id)?;
+        self.save(&mut inner)
+    }
+
+    fn forget(&self, inner: &mut Inner, group_id: Uuid) -> Result<()> {
+        if let Some(mut group) = inner.device.load_group(group_id.as_bytes())? {
+            inner.device.delete_group(&mut group)?;
+        }
+        inner.state.groups.retain(|g| g.id != group_id);
         Ok(())
     }
 
-    /// Oldest-first page of history ending just before `before_id` (or the latest messages).
-    pub async fn history(&self, group_id: &str, before_id: Option<i64>) -> Result<Vec<ChatMessage>> {
-        let secret = self.group_secret(group_id)?;
-        let token = self.access_token().await?;
-        let mut rows = self.sb()?.messages_before(&token, group_id, before_id, PAGE_SIZE).await?;
-        rows.reverse();
-        Ok(rows.iter().filter_map(|r| self.decrypt_row(&secret, r)).collect())
+    // ---- messages ---------------------------------------------------------------
+
+    pub async fn send(&self, group_id: Uuid, text: &str) -> Result<ChatMessage> {
+        self.send_with_id(group_id, &hex::encode(random_bytes::<16>()), text).await
     }
 
-    pub async fn send(&self, group_id: &str, text: &str) -> Result<ChatMessage> {
+    /// Like [`Hermes::send`] with a caller-chosen id. Retrying a send whose
+    /// outcome is unknown with the same id never shows the message twice:
+    /// every client drops bodies whose id it already has.
+    pub async fn send_with_id(&self, group_id: Uuid, id: &str, text: &str) -> Result<ChatMessage> {
         let text = text.trim();
         if text.is_empty() {
             return Err(Error::Invalid("Message is empty.".into()));
@@ -266,71 +538,372 @@ impl Hermes {
         if text.chars().count() > MAX_MESSAGE_CHARS {
             return Err(Error::Invalid(format!("Messages are limited to {MAX_MESSAGE_CHARS} characters.")));
         }
-        let secret = self.group_secret(group_id)?;
-        let body = MessageBody {
-            id: hex::encode(random_bytes::<16>()),
-            name: self.state.lock().unwrap().display_name.clone(),
+        if id.is_empty() || id.len() > 64 {
+            return Err(Error::Invalid("Bad message id.".into()));
+        }
+        let mut inner = self.inner.lock().await;
+        if inner.group_mut(group_id)?.removed {
+            return Err(Error::Invalid("You are no longer in this group.".into()));
+        }
+        let token = self.token(&mut inner).await?;
+        let body = Body {
+            v: 1,
+            id: id.to_owned(),
+            name: inner.state.display_name.clone(),
             text: text.to_owned(),
             sent_at: now_ms(),
         };
-        let sealed = seal_message(&secret, &self.identity, &body);
-        let token = self.access_token().await?;
-        let row = self.sb()?.post_message(&token, group_id, &sealed).await?;
-        self.decrypt_row(&secret, &row)
-            .ok_or_else(|| Error::Malformed("server returned an unreadable copy of the message".into()))
-    }
+        let plaintext = serde_json::to_vec(&body)?;
+        let mut events = Vec::new();
 
-    fn decrypt_row(&self, secret: &GroupSecret, row: &MessageRow) -> Option<ChatMessage> {
-        {
-            let mut seen = self.last_seen.lock().unwrap();
-            let last = seen.entry(row.group_id.clone()).or_default();
-            *last = (*last).max(row.id);
-        }
-        let body = match open_message(secret, &row.sealed) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("dropping message {} in {}: {e}", row.id, row.group_id);
-                return None;
+        for attempt in 0..2 {
+            if attempt == 1 {
+                self.sync_group(&mut inner, &token, group_id, &mut events).await?;
             }
-        };
-        Some(ChatMessage {
-            id: row.id,
-            group_id: row.group_id.clone(),
-            sender_name: body.name,
-            sender_fingerprint: fingerprint(&row.sealed.sender_pub),
-            mine: row.sealed.sender_pub == self.identity.public_hex(),
-            text: body.text,
-            sent_at: body.sent_at,
-            created_at: row.created_at.clone(),
-        })
+            let mut group = inner.load_group(group_id)?;
+            let payload = inner.device.encrypt(&mut group, &plaintext)?;
+            match self.sb()?.post_message(&token, group_id, epoch(&group), &B64.encode(payload)).await {
+                Ok(_) => {
+                    let msg = ChatMessage {
+                        id: body.id.clone(),
+                        group_id,
+                        sender_name: body.name.clone(),
+                        sender_credential: inner.device.credential_hex(),
+                        sender_fingerprint: fingerprint(&inner.device.credential_hex()),
+                        mine: true,
+                        text: body.text.clone(),
+                        sent_at: body.sent_at,
+                    };
+                    inner.group_mut(group_id)?.push_message(msg.clone());
+                    self.save(&mut inner)?;
+                    return Ok(msg);
+                }
+                Err(e) if e.is_epoch_conflict() && attempt == 0 => continue,
+                Err(e) => {
+                    // The sending ratchet advanced either way; persist it.
+                    self.save(&mut inner)?;
+                    return Err(e);
+                }
+            }
+        }
+        unreachable!("the loop returns on its second attempt")
     }
 
-    /// Streams live messages and connection status until `on_event` returns
-    /// `false` or the task is dropped. Missed messages are fetched after every
-    /// reconnect.
-    pub async fn run_realtime(self: Arc<Self>, mut on_event: impl FnMut(HermesEvent) -> bool) -> Result<()> {
+    // ---- sync -------------------------------------------------------------------
+
+    /// Brings everything up to date: finishes joins, notices removals and role
+    /// changes, applies new commits and messages in server order, and, for
+    /// groups this user administers, accepts pending join requests and commits
+    /// removals for members who left.
+    pub async fn sync(&self) -> Result<Vec<HermesEvent>> {
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        let mut events = Vec::new();
+
+        self.finish_joins(&mut inner, &token, &mut events).await?;
+        self.refresh_memberships(&mut inner, &token, &mut events).await?;
+        let active: Vec<Uuid> = inner.state.groups.iter().filter(|g| !g.removed).map(|g| g.id).collect();
+        for gid in &active {
+            if let Err(e) = self.sync_group(&mut inner, &token, *gid, &mut events).await {
+                tracing::warn!("sync of group {gid} failed: {e}");
+            }
+        }
+        self.admin_duties(&mut inner, &token, &mut events).await?;
+        self.save(&mut inner)?;
+        Ok(events)
+    }
+
+    async fn finish_joins(&self, inner: &mut Inner, token: &str, events: &mut Vec<HermesEvent>) -> Result<()> {
+        let sb = self.sb()?;
+        for pj in inner.state.pending_joins.clone() {
+            let row = sb.join_request(token, pj.request_id).await?;
+            let outcome = match row {
+                Some(JoinRequestRow { status, welcome: Some(welcome), .. }) if status == "accepted" => {
+                    let welcome = B64.decode(welcome).map_err(|_| Error::Malformed("welcome".into()))?;
+                    match inner.device.join(&welcome) {
+                        Ok(group) => {
+                            inner.state.groups.retain(|g| g.id != pj.group_id);
+                            inner.state.groups.push(GroupState {
+                                id: pj.group_id,
+                                name: mls::group_name(&group),
+                                role: Role::Member,
+                                last_id: 0,
+                                removed: false,
+                                messages: Vec::new(),
+                                names: Default::default(),
+                            });
+                            events.push(HermesEvent::GroupsChanged);
+                            None
+                        }
+                        Err(e) => Some(format!("The invitation could not be opened: {e}")),
+                    }
+                }
+                Some(_) if now_ms() < pj.deadline => continue,
+                Some(_) => Some("No admin accepted the request before the invite code expired.".to_owned()),
+                None => Some("The join request no longer exists.".to_owned()),
+            };
+            inner.state.pending_joins.retain(|p| p.request_id != pj.request_id);
+            if let Some(reason) = outcome {
+                events.push(HermesEvent::JoinFailed { reason });
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies role changes and detects removal (the server stops showing the
+    /// membership the moment an admin's Remove commit is accepted).
+    async fn refresh_memberships(&self, inner: &mut Inner, token: &str, events: &mut Vec<HermesEvent>) -> Result<()> {
+        let Some(user_id) = inner.my_user_id() else { return Ok(()) };
+        let rows = self.sb()?.my_memberships(token, user_id).await?;
+        let mut removed = Vec::new();
+        let mut changed = false;
+        for g in inner.state.groups.iter_mut().filter(|g| !g.removed) {
+            match rows.iter().find(|r| r.group_id == g.id) {
+                Some(r) if r.role != g.role => {
+                    g.role = r.role;
+                    changed = true;
+                }
+                Some(_) => {}
+                None => removed.push(g.id),
+            }
+        }
+        for gid in removed {
+            self.mark_removed(inner, gid)?;
+            changed = true;
+        }
+        if changed {
+            events.push(HermesEvent::GroupsChanged);
+        }
+        Ok(())
+    }
+
+    /// Keeps the conversation but drops the MLS secrets: nothing new could be
+    /// decrypted with them anyway.
+    fn mark_removed(&self, inner: &mut Inner, group_id: Uuid) -> Result<()> {
+        if let Some(mut group) = inner.device.load_group(group_id.as_bytes())? {
+            inner.device.delete_group(&mut group)?;
+        }
+        inner.group_mut(group_id)?.removed = true;
+        Ok(())
+    }
+
+    /// Settles a commit whose server outcome was unknown (network error).
+    async fn reconcile_pending(&self, inner: &mut Inner, token: &str, group_id: Uuid, group: &mut MlsGroup) -> Result<()> {
+        if !Device::has_pending_commit(group) {
+            return Ok(());
+        }
+        let stored = self.sb()?.commit_at(token, group_id, epoch(group)).await?;
+        if stored.is_some_and(|row| row.sender_credential == inner.device.credential_hex()) {
+            inner.device.merge_pending_commit(group)
+        } else {
+            inner.device.clear_pending_commit(group)
+        }
+    }
+
+    async fn sync_group(&self, inner: &mut Inner, token: &str, group_id: Uuid, events: &mut Vec<HermesEvent>) -> Result<()> {
+        let sb = self.sb()?;
+        let mut group = inner.load_group(group_id)?;
+        self.reconcile_pending(inner, token, group_id, &mut group).await?;
+        loop {
+            let after = inner.group_mut(group_id)?.last_id;
+            let rows = sb.messages_after(token, group_id, after, PAGE).await?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for row in &rows {
+                if !self.apply_row(inner, group_id, &mut group, row, events)? {
+                    return Ok(());
+                }
+                inner.group_mut(group_id)?.last_id = row.id;
+            }
+        }
+    }
+
+    /// Returns false when processing must stop (removed, or a gap in epochs).
+    fn apply_row(
+        &self,
+        inner: &mut Inner,
+        group_id: Uuid,
+        group: &mut MlsGroup,
+        row: &MessageRow,
+        events: &mut Vec<HermesEvent>,
+    ) -> Result<bool> {
+        let mine = inner.device.credential_hex();
+        // Our own commits were merged when the server accepted them, and MLS
+        // never lets a sender decrypt its own application messages.
+        if row.sender_credential == mine {
+            return Ok(true);
+        }
+        let Ok(bytes) = B64.decode(&row.payload) else {
+            tracing::warn!("skipping undecodable row {}", row.id);
+            return Ok(true);
+        };
+        if row.kind == "commit" {
+            if row.epoch < epoch(group) {
+                return Ok(true);
+            }
+            if row.epoch > epoch(group) {
+                tracing::error!("group {group_id}: commit for epoch {} while at {}", row.epoch, epoch(group));
+                return Ok(false);
+            }
+        }
+        match inner.device.process(group, &bytes) {
+            Ok(Incoming::Commit { removed_me: true }) => {
+                self.mark_removed(inner, group_id)?;
+                events.push(HermesEvent::GroupsChanged);
+                Ok(false)
+            }
+            Ok(Incoming::Commit { .. } | Incoming::Ignored) => Ok(true),
+            Ok(Incoming::Application { sender, data }) => {
+                if sender != row.sender_credential {
+                    tracing::warn!("row {}: MLS sender differs from the server's record; dropped", row.id);
+                    return Ok(true);
+                }
+                let Ok(body) = serde_json::from_slice::<Body>(&data) else {
+                    tracing::warn!("row {}: unreadable message body", row.id);
+                    return Ok(true);
+                };
+                let msg = ChatMessage {
+                    id: body.id,
+                    group_id,
+                    sender_name: body.name,
+                    sender_fingerprint: fingerprint(&sender),
+                    sender_credential: sender,
+                    mine: false,
+                    text: body.text,
+                    sent_at: body.sent_at,
+                };
+                if inner.group_mut(group_id)?.push_message(msg.clone()) {
+                    events.push(HermesEvent::Message { message: msg });
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!("row {} in {group_id} could not be processed: {e}", row.id);
+                Ok(true)
+            }
+        }
+    }
+
+    async fn admin_duties(&self, inner: &mut Inner, token: &str, events: &mut Vec<HermesEvent>) -> Result<()> {
+        let admin_groups: Vec<Uuid> = inner
+            .state
+            .groups
+            .iter()
+            .filter(|g| !g.removed && g.role.is_admin())
+            .map(|g| g.id)
+            .collect();
+        if admin_groups.is_empty() {
+            return Ok(());
+        }
+        let sb = self.sb()?;
+        let me = inner.my_user_id();
+        for req in sb.pending_requests(token).await? {
+            if admin_groups.contains(&req.group_id)
+                && Some(req.requester_id) != me
+                && let Err(e) = self.accept(inner, token, &req, events).await
+            {
+                tracing::warn!("could not accept join request {}: {e}", req.id);
+            }
+        }
+        for dep in sb.departures(token).await? {
+            if !admin_groups.contains(&dep.group_id) {
+                continue;
+            }
+            let result: Result<()> = async {
+                for attempt in 0..2 {
+                    self.sync_group(inner, token, dep.group_id, events).await?;
+                    let mut group = inner.load_group(dep.group_id)?;
+                    let commit = inner.device.remove_member(&mut group, &dep.credential)?;
+                    match sb.complete_departure(token, dep.id, epoch(&group), &B64.encode(commit)).await {
+                        Ok(_) => return inner.device.merge_pending_commit(&mut group),
+                        Err(e) if e.is_epoch_conflict() && attempt == 0 => inner.device.clear_pending_commit(&mut group)?,
+                        Err(e @ Error::Api { .. }) => {
+                            inner.device.clear_pending_commit(&mut group)?;
+                            return Err(e);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = result {
+                tracing::warn!("could not commit departure {}: {e}", dep.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the requester with an MLS commit and hands them the Welcome.
+    async fn accept(&self, inner: &mut Inner, token: &str, req: &JoinRequestRow, events: &mut Vec<HermesEvent>) -> Result<()> {
+        let sb = self.sb()?;
+        let key_package = B64.decode(&req.key_package).map_err(|_| Error::Malformed("key package".into()))?;
+        for attempt in 0..2 {
+            self.sync_group(inner, token, req.group_id, events).await?;
+            let mut group = inner.load_group(req.group_id)?;
+            let (commit, welcome) = inner.device.add_member(&mut group, &key_package, &req.credential)?;
+            match sb
+                .add_member(token, req.id, epoch(&group), &B64.encode(commit), &B64.encode(welcome))
+                .await
+            {
+                Ok(_) => return inner.device.merge_pending_commit(&mut group),
+                Err(e) if e.is_epoch_conflict() && attempt == 0 => inner.device.clear_pending_commit(&mut group)?,
+                Err(e @ Error::Api { .. }) => {
+                    // Already handled by another admin, or expired.
+                    inner.device.clear_pending_commit(&mut group)?;
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Streams events until `on_event` returns `false`. Realtime notifications
+    /// trigger a sync; a periodic sync covers anything Realtime missed.
+    pub async fn run(self: Arc<Self>, mut on_event: impl FnMut(HermesEvent) -> bool) -> Result<()> {
         let ws_url = self.sb()?.config().realtime_url();
         let (tx, mut rx) = mpsc::channel(64);
         let me = self.clone();
-        let task = tokio::spawn(realtime::run(ws_url, move || {
-            let me = me.clone();
-            async move { me.access_token().await }
-        }, tx));
+        let task = tokio::spawn(realtime::run(
+            ws_url,
+            move || {
+                let me = me.clone();
+                async move { me.access_token().await }
+            },
+            tx,
+        ));
+        let mut tick = tokio::time::interval(SYNC_INTERVAL);
 
-        while let Some(ev) = rx.recv().await {
-            let events = match ev {
-                RealtimeEvent::Connected => {
-                    let mut out = vec![HermesEvent::Online];
-                    out.extend(self.catch_up().await.into_iter().map(|message| HermesEvent::Message { message }));
-                    out
-                }
-                RealtimeEvent::Insert(row) => match self.group_secret(&row.group_id) {
-                    Ok(secret) => self.decrypt_row(&secret, &row).map(|message| HermesEvent::Message { message }).into_iter().collect(),
-                    Err(_) => vec![],
+        loop {
+            let mut out = Vec::new();
+            let first = tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(ev) => Some(ev),
+                    None => break,
                 },
-                RealtimeEvent::Disconnected(reason) => vec![HermesEvent::Offline { reason }],
+                _ = tick.tick() => None,
             };
-            for e in events {
+            let mut needs_sync = first.is_none();
+            // Coalesce a burst of notifications into one sync.
+            for ev in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+                match ev {
+                    RealtimeEvent::Connected => {
+                        out.push(HermesEvent::Online);
+                        needs_sync = true;
+                    }
+                    RealtimeEvent::Changed => needs_sync = true,
+                    RealtimeEvent::Disconnected(reason) => out.push(HermesEvent::Offline { reason }),
+                }
+            }
+            if needs_sync {
+                match self.sync().await {
+                    Ok(events) => out.extend(events),
+                    Err(e) => tracing::warn!("sync failed: {e}"),
+                }
+            }
+            for e in out {
                 if !on_event(e) {
                     task.abort();
                     return Ok(());
@@ -340,19 +913,57 @@ impl Hermes {
         Ok(())
     }
 
-    /// Fetches messages newer than the last one seen in each group.
-    async fn catch_up(&self) -> Vec<ChatMessage> {
-        let Ok(token) = self.access_token().await else { return vec![] };
-        let Ok(sb) = self.sb() else { return vec![] };
-        let mut out = Vec::new();
-        for g in self.groups() {
-            let Some(after) = self.last_seen.lock().unwrap().get(&g.id).copied() else { continue };
-            let Ok(secret) = self.group_secret(&g.id) else { continue };
-            match sb.messages_after(&token, &g.id, after, 200).await {
-                Ok(rows) => out.extend(rows.iter().filter_map(|r| self.decrypt_row(&secret, r))),
-                Err(e) => tracing::warn!("catch-up failed for {}: {e}", g.id),
-            }
+    /// Test support: tries to decrypt a raw server payload with this device's
+    /// current MLS state for `group_id`. Not used by the app.
+    #[doc(hidden)]
+    pub async fn try_decrypt_payload(&self, group_id: Uuid, payload_b64: &str) -> Result<Vec<u8>> {
+        let inner = self.inner.lock().await;
+        let mut group = inner.load_group(group_id)?;
+        let bytes = B64.decode(payload_b64).map_err(|_| Error::Malformed("payload".into()))?;
+        match inner.device.process(&mut group, &bytes)? {
+            Incoming::Application { data, .. } => Ok(data),
+            other => Err(Error::Mls(format!("not an application message: {other:?}"))),
         }
-        out
+    }
+
+    /// Test support: the server user id of the current session.
+    #[doc(hidden)]
+    pub async fn user_id(&self) -> Option<Uuid> {
+        self.inner.lock().await.my_user_id()
+    }
+
+    /// Test support: drops the session, as if the anonymous user's refresh
+    /// token had been lost. The next request signs in again and reclaims the device.
+    #[doc(hidden)]
+    pub async fn forget_session(&self) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        inner.state.session = None;
+        self.save(&mut inner)
+    }
+}
+
+fn group_info(g: &GroupState) -> GroupInfo {
+    GroupInfo { id: g.id, name: g.name.clone(), role: g.role, removed: g.removed }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_codes_are_80_bit_crockford() {
+        let a = generate_invite_code();
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|b| CROCKFORD.contains(&b)));
+        assert_ne!(a, generate_invite_code());
+    }
+
+    #[test]
+    fn invite_codes_tolerate_typing() {
+        let code = "0123456789ABCDEF".replace('B', "C").replace('F', "G");
+        let typed = format_invite_code(&code).to_lowercase().replace('0', "o").replace('1', "l");
+        assert_eq!(normalize_invite_code(&format!(" {typed} ")).as_deref(), Some(code.as_str()));
+        assert_eq!(normalize_invite_code("too-short"), None);
+        assert_eq!(normalize_invite_code("UUUUUUUUUUUUUUUU"), None, "U is not in the alphabet");
     }
 }

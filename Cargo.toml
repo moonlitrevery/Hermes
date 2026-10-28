@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/hermes-core", "app/src-tauri"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

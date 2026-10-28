@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Hermes</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="main.js"></script>
+</head>
+<body>
+  <div id="app" class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <span class="sigil" aria-hidden="true"></span>
+        <h1>Hermes</h1>
+        <span id="status" class="status" title="Connecting…"></span>
+      </header>
+
+      <button id="profile-chip" class="profile-chip" type="button">
+        <span id="profile-name" class="profile-name"></span>
+        <span id="profile-fp" class="fingerprint"></span>
+      </button>
+
+      <div class="actions">
+        <button id="new-group" type="button" class="btn primary">New group</button>
+        <button id="join-group" type="button" class="btn">Join with code</button>
+      </div>
+
+      <nav id="groups" class="groups" aria-label="Groups"></nav>
+      <p id="groups-empty" class="empty">No groups yet. Create one, or paste an invite code from a friend.</p>
+    </aside>
+
+    <main class="chat" id="chat">
+      <div id="chat-placeholder" class="placeholder">
+        <span class="sigil large" aria-hidden="true"></span>
+        <p>Select a group to start talking.</p>
+        <p class="hint">Messages are encrypted on this device. The server only ever sees ciphertext.</p>
+      </div>
+
+      <section id="chat-view" class="chat-view" hidden>
+        <header class="chat-header">
+          <button id="back" type="button" class="icon-btn back" aria-label="Back to groups">&larr;</button>
+          <h2 id="chat-title"></h2>
+          <button id="show-invite" type="button" class="btn small">Invite</button>
+          <button id="leave" type="button" class="btn small danger">Leave</button>
+        </header>
+        <div id="messages" class="messages" role="log" aria-live="polite">
+          <button id="load-older" type="button" class="btn small load-older" hidden>Load earlier messages</button>
+        </div>
+        <form id="composer" class="composer" autocomplete="off">
+          <textarea id="input" rows="1" placeholder="Write a message…" maxlength="8000" aria-label="Message"></textarea>
+          <button type="submit" class="btn primary">Send</button>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <dialog id="dialog">
+    <form method="dialog" id="dialog-form">
+      <h3 id="dialog-title"></h3>
+      <p id="dialog-text" class="dialog-text"></p>
+      <input id="dialog-input" autocomplete="off" spellcheck="false">
+      <code id="dialog-code" class="invite-code"></code>
+      <p id="dialog-error" class="error" role="alert"></p>
+      <menu>
+        <button value="cancel" type="button" id="dialog-cancel" class="btn">Cancel</button>
+        <button value="ok" type="submit" id="dialog-ok" class="btn primary">OK</button>
+      </menu>
+    </form>
+  </dialog>
+</body>
+</html>

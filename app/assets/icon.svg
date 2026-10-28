@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="220" fill="#0d0a0b"/>
+  <circle cx="512" cy="512" r="360" fill="none" stroke="#b3122e" stroke-width="28"/>
+  <circle cx="512" cy="512" r="300" fill="none" stroke="#b3122e" stroke-width="6" stroke-dasharray="18 22"/>
+  <!-- winged staff: a nod to Hermes -->
+  <path d="M512 250 V780" stroke="#e8d9c7" stroke-width="34" stroke-linecap="round"/>
+  <path d="M512 330 C 420 300 340 330 300 400 C 380 380 440 390 512 420 C 584 390 644 380 724 400 C 684 330 604 300 512 330 Z" fill="#b3122e"/>
+  <path d="M440 500 C 600 540 600 600 512 630 C 424 660 424 720 584 740" fill="none" stroke="#e8d9c7" stroke-width="22" stroke-linecap="round"/>
+  <path d="M584 500 C 424 540 424 600 512 630 C 600 660 600 720 440 740" fill="none" stroke="#b3122e" stroke-width="22" stroke-linecap="round"/>
+</svg>

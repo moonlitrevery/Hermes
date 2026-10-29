@@ -45,6 +45,9 @@ pub struct GroupState {
     /// Removed by an admin; the MLS state has been deleted.
     #[serde(default)]
     pub removed: bool,
+    /// Set when a commit broke the group's rules; the group is then frozen.
+    #[serde(default)]
+    pub halted: Option<String>,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
     /// Display names learned from messages, by credential.
@@ -147,6 +150,7 @@ mod tests {
             role: Role::Member,
             last_id: 0,
             removed: false,
+            halted: None,
             messages: vec![],
             names: HashMap::new(),
         };

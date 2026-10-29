@@ -550,6 +550,11 @@ begin
   ) then
     raise exception 'The owner cannot leave while others are in the group.' using errcode = 'PT403';
   end if;
+  -- Only the owner may remove an admin from the MLS group, so an admin steps
+  -- down first; then any admin can commit their removal.
+  if v_role = 'admin' then
+    raise exception 'Step down as admin before leaving.' using errcode = 'PT409';
+  end if;
   delete from public.members where group_id = p_group_id and user_id = v_uid;
   if exists (select 1 from public.groups where id = p_group_id) then
     insert into public.departures (group_id, credential) values (p_group_id, v_cred)
@@ -558,26 +563,38 @@ begin
 end
 $$;
 
--- Only the owner promotes and demotes; the owner's own role never changes.
-create function public.set_role(p_group_id uuid, p_user_id uuid, p_role public.group_role)
-returns void
+-- Role changes are MLS commits too: clients check them against the roles in
+-- the group state, and so does this function. Only the owner promotes and
+-- demotes; an admin may step down; the owner's role never changes.
+create function public.set_role(p_group_id uuid, p_user_id uuid, p_role public.group_role, p_epoch bigint, p_commit text)
+returns bigint
 language plpgsql
 security definer
 set search_path = ''
 as $$
+declare
+  v_uid    uuid := private.require_user();
+  v_mine   public.group_role := private.my_role(p_group_id);
+  v_target public.group_role;
+  v_epoch  bigint;
 begin
-  perform private.require_user();
-  if private.my_role(p_group_id) is distinct from 'owner' then
-    raise exception 'Only the owner can change roles.' using errcode = 'PT403';
-  end if;
   if p_role not in ('admin', 'member') then
     raise exception 'Role must be admin or member.' using errcode = 'PT400';
   end if;
-  update public.members set role = p_role
-  where group_id = p_group_id and user_id = p_user_id and role <> 'owner';
-  if not found then
-    raise exception 'Not a member, or the owner.' using errcode = 'PT404';
+  select m.role into v_target from public.members m where m.group_id = p_group_id and m.user_id = p_user_id;
+  if v_mine is null or v_target is null then
+    raise exception 'Not a member of this group.' using errcode = 'PT404';
   end if;
+  if v_target = 'owner' then
+    raise exception 'The owner''s role cannot change.' using errcode = 'PT403';
+  end if;
+  if not (v_mine = 'owner' or (p_user_id = v_uid and v_mine = 'admin' and p_role = 'member')) then
+    raise exception 'Only the owner can change roles.' using errcode = 'PT403';
+  end if;
+
+  v_epoch := private.append_commit(p_group_id, p_epoch, p_commit, private.my_credential(p_group_id));
+  update public.members set role = p_role where group_id = p_group_id and user_id = p_user_id;
+  return v_epoch;
 end
 $$;
 
@@ -668,7 +685,7 @@ grant execute on function
   public.remove_member(uuid, uuid, bigint, text),
   public.complete_departure(uuid, bigint, text),
   public.leave_group(uuid),
-  public.set_role(uuid, uuid, public.group_role),
+  public.set_role(uuid, uuid, public.group_role, bigint, text),
   public.post_message(uuid, bigint, text),
   public.claim_device(text)
 to authenticated;

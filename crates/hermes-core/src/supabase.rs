@@ -245,8 +245,13 @@ impl Supabase {
         self.rpc_unit(token, "leave_group", json!({ "p_group_id": group_id })).await
     }
 
-    pub async fn set_role(&self, token: &str, group_id: Uuid, user_id: Uuid, role: Role) -> Result<()> {
-        self.rpc_unit(token, "set_role", json!({ "p_group_id": group_id, "p_user_id": user_id, "p_role": role })).await
+    pub async fn set_role(&self, token: &str, group_id: Uuid, user_id: Uuid, role: Role, epoch: i64, commit: &str) -> Result<i64> {
+        self.rpc(
+            token,
+            "set_role",
+            json!({ "p_group_id": group_id, "p_user_id": user_id, "p_role": role, "p_epoch": epoch, "p_commit": commit }),
+        )
+        .await
     }
 
     pub async fn post_message(&self, token: &str, group_id: Uuid, epoch: i64, payload: &str) -> Result<i64> {

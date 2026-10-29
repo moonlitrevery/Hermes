@@ -254,3 +254,4 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; margin: 16px 0
 }
 .member-who { display: flex; flex-direction: column; flex: 1; min-width: 0; }
 .member-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag.warn { border-color: var(--crimson); color: var(--crimson-hi); }

@@ -3,7 +3,7 @@
 -- =============================================================================
 begin;
 \ir _helpers.psql
-select plan(27);
+select plan(32);
 
 select tests.seed_world();
 
@@ -75,44 +75,57 @@ select throws_ok(
 );
 
 -- ---------------------------------------------------------------------------
--- set_role: only the owner promotes and demotes
+-- set_role: a commit; only the owner promotes and demotes, admins may step down
 -- ---------------------------------------------------------------------------
 select tests.login('ada');
 select throws_ok(
-  format($$ select public.set_role(%L, %L, 'admin') $$, tests.gid(), tests.uid('mia')),
+  format($$ select public.set_role(%L, %L, 'admin', 0, 'cg==') $$, tests.gid(), tests.uid('mia')),
   'PT403', 'Only the owner can change roles.',
   'set_role: an admin cannot promote'
 );
 select tests.login('mia');
 select throws_ok(
-  format($$ select public.set_role(%L, %L, 'admin') $$, tests.gid(), tests.uid('mia')),
+  format($$ select public.set_role(%L, %L, 'admin', 0, 'cg==') $$, tests.gid(), tests.uid('mia')),
   'PT403', null,
   'set_role: a member cannot promote themselves'
 );
 select tests.login('olga');
-select lives_ok(
-  format($$ select public.set_role(%L, %L, 'admin') $$, tests.gid(), tests.uid('mia')),
-  'set_role: the owner promotes a member to admin'
+select throws_ok(
+  format($$ select public.set_role(%L, %L, 'admin', 3, 'cg==') $$, tests.gid(), tests.uid('mia')),
+  'PT409', null,
+  'set_role: a role commit for the wrong epoch is refused'
 );
-select lives_ok(
-  format($$ select public.set_role(%L, %L, 'member') $$, tests.gid(), tests.uid('ada')),
-  'set_role: the owner demotes an admin'
-);
+select is(public.set_role(tests.gid(), tests.uid('mia'), 'admin', 0, 'cg=='), 1::bigint,
+  'set_role: the owner promotes a member to admin, as a commit for the current epoch');
+select is(public.set_role(tests.gid(), tests.uid('ada'), 'member', 1, 'cg=='), 2::bigint,
+  'set_role: the owner demotes an admin');
 select results_eq(
   format($$ select m.role::text from public.members m where m.group_id = %L order by m.role $$, tests.gid()),
   $$ select r from (values ('owner'), ('admin'), ('member')) v (r) $$,
   'set_role: roles changed as requested'
 );
+select is((select count(*) from public.messages where kind = 'commit'), 2::bigint,
+  'set_role: each role change is stored as a commit');
 select throws_ok(
-  format($$ select public.set_role(%L, %L, 'owner') $$, tests.gid(), tests.uid('mia')),
+  format($$ select public.set_role(%L, %L, 'owner', 2, 'cg==') $$, tests.gid(), tests.uid('mia')),
   'PT400', null,
   'set_role: ownership cannot be handed out through set_role'
 );
 select throws_ok(
-  format($$ select public.set_role(%L, %L, 'member') $$, tests.gid(), tests.uid('olga')),
-  'PT404', null,
+  format($$ select public.set_role(%L, %L, 'member', 2, 'cg==') $$, tests.gid(), tests.uid('olga')),
+  'PT403', 'The owner''s role cannot change.',
   'set_role: the owner cannot be demoted'
 );
+select tests.login('mia');
+select throws_ok(
+  format($$ select public.set_role(%L, %L, 'admin', 2, 'cg==') $$, tests.gid(), tests.uid('ada')),
+  'PT403', null,
+  'set_role: an admin cannot promote someone else'
+);
+select is(public.set_role(tests.gid(), tests.uid('mia'), 'member', 2, 'cg=='), 3::bigint,
+  'set_role: an admin may step down');
+select tests.login('olga');
+select public.set_role(tests.gid(), tests.uid('ada'), 'admin', 3, 'cg==');
 
 -- ---------------------------------------------------------------------------
 -- leave_group
@@ -124,6 +137,12 @@ select throws_ok(
   'leave_group: the owner cannot leave while others remain'
 );
 select tests.login('ada');
+select throws_ok(
+  format($$ select public.leave_group(%L) $$, tests.gid()),
+  'PT409', 'Step down as admin before leaving.',
+  'leave_group: an admin steps down before leaving (only the owner may remove an admin from MLS)'
+);
+select public.set_role(tests.gid(), tests.uid('ada'), 'member', 4, 'cg==');
 select lives_ok(format($$ select public.leave_group(%L) $$, tests.gid()), 'leave_group: a member leaves');
 select is(
   (select count(*) from public.groups where id = tests.gid()), 0::bigint,

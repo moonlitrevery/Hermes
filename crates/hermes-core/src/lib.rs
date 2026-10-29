@@ -57,6 +57,8 @@ pub enum Error {
     UnknownGroup,
     #[error("MLS: {0}")]
     Mls(String),
+    #[error("This group received an invalid change and was frozen: {0}")]
+    InvalidChange(String),
     #[error("secure storage: {0}")]
     Keystore(String),
     #[error("network error: {0}")]
@@ -167,6 +169,8 @@ pub struct GroupInfo {
     pub name: String,
     pub role: Role,
     pub removed: bool,
+    /// Why the group was frozen after receiving an invalid change, if it was.
+    pub halted: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -204,6 +208,9 @@ pub enum HermesEvent {
     /// Groups were joined, removed, or changed role; reload the list.
     GroupsChanged,
     JoinFailed { reason: String },
+    /// A commit broke the group's rules (e.g. a plain member adding someone).
+    /// It was not applied; the group is frozen at its last valid epoch.
+    InvalidChange { group_id: Uuid, reason: String },
     Online,
     Offline { reason: String },
 }
@@ -382,6 +389,7 @@ impl Hermes {
             role: Role::Owner,
             last_id: 0,
             removed: false,
+            halted: None,
             messages: Vec::new(),
             names: Default::default(),
         };
@@ -437,12 +445,14 @@ impl Hermes {
         let rows = self.sb()?.members(&token, group_id).await?;
         let mine = inner.device.credential_hex();
         let my_name = inner.state.display_name.clone();
+        // Roles come from the MLS group state, which every member agreed on.
+        let roles = mls::roles(&inner.load_group(group_id)?);
         let gs = inner.group_mut(group_id)?;
         Ok(rows
             .into_iter()
             .map(|r| MemberInfo {
                 user_id: r.user_id,
-                role: r.role,
+                role: roles.as_ref().map_or(Role::Member, |x| x.role_of(&r.credential)),
                 me: r.credential == mine,
                 name: if r.credential == mine { Some(my_name.clone()) } else { gs.names.get(&r.credential).cloned() },
                 fingerprint: fingerprint(&r.credential),
@@ -450,11 +460,46 @@ impl Hermes {
             .collect())
     }
 
-    /// Only the owner promotes or demotes (enforced by the server).
+    /// Only the owner promotes or demotes; an admin may also step down. The
+    /// change is an MLS commit, so every client checks who made it.
     pub async fn set_role(&self, group_id: Uuid, user_id: Uuid, role: Role) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        let token = self.token(&mut inner).await?;
-        self.sb()?.set_role(&token, group_id, user_id, role).await
+        self.set_role_locked(&mut inner, group_id, user_id, role).await
+    }
+
+    async fn set_role_locked(&self, inner: &mut Inner, group_id: Uuid, user_id: Uuid, role: Role) -> Result<()> {
+        let token = self.token(inner).await?;
+        let sb = self.sb()?;
+        let target = sb
+            .members(&token, group_id)
+            .await?
+            .into_iter()
+            .find(|m| m.user_id == user_id)
+            .ok_or_else(|| Error::Invalid("That person is not in the group.".into()))?;
+        let mut events = Vec::new();
+        for attempt in 0..2 {
+            self.sync_group(inner, &token, group_id, &mut events).await?;
+            let mut group = inner.load_group(group_id)?;
+            let commit = inner.device.set_role(&mut group, &target.credential, role)?;
+            match sb.set_role(&token, group_id, user_id, role, epoch(&group), &B64.encode(commit)).await {
+                Ok(_) => {
+                    inner.device.merge_pending_commit(&mut group)?;
+                    self.refresh_role(inner, group_id, &group)?;
+                    break;
+                }
+                Err(e) if e.is_epoch_conflict() && attempt == 0 => inner.device.clear_pending_commit(&mut group)?,
+                Err(e @ Error::Api { .. }) => {
+                    inner.device.clear_pending_commit(&mut group)?;
+                    self.save(inner)?;
+                    return Err(e);
+                }
+                Err(e) => {
+                    self.save(inner)?;
+                    return Err(e);
+                }
+            }
+        }
+        self.save(inner)
     }
 
     /// Commits an MLS Remove: the removed member can't decrypt anything sent
@@ -501,8 +546,17 @@ impl Hermes {
     /// then commits the MLS removal. The owner can only leave an empty group.
     pub async fn leave_group(&self, group_id: Uuid) -> Result<()> {
         let mut inner = self.inner.lock().await;
-        let removed = inner.group_mut(group_id)?.removed;
+        let (removed, role, halted) = {
+            let g = inner.group_mut(group_id)?;
+            (g.removed, g.role, g.halted.is_some())
+        };
         if !removed {
+            // Only the owner may remove an admin, so an admin first steps down
+            // (a commit every client accepts); any admin can then remove them.
+            if role == Role::Admin && !halted {
+                let me = inner.my_user_id().ok_or_else(|| Error::Invalid("Not signed in.".into()))?;
+                self.set_role_locked(&mut inner, group_id, me, Role::Member).await?;
+            }
             let token = self.token(&mut inner).await?;
             match self.sb()?.leave_group(&token, group_id).await {
                 Ok(()) | Err(Error::Api { status: 404, .. }) => {}
@@ -542,8 +596,12 @@ impl Hermes {
             return Err(Error::Invalid("Bad message id.".into()));
         }
         let mut inner = self.inner.lock().await;
-        if inner.group_mut(group_id)?.removed {
+        let g = inner.group_mut(group_id)?;
+        if g.removed {
             return Err(Error::Invalid("You are no longer in this group.".into()));
+        }
+        if let Some(reason) = &g.halted {
+            return Err(Error::InvalidChange(reason.clone()));
         }
         let token = self.token(&mut inner).await?;
         let body = Body {
@@ -602,7 +660,7 @@ impl Hermes {
 
         self.finish_joins(&mut inner, &token, &mut events).await?;
         self.refresh_memberships(&mut inner, &token, &mut events).await?;
-        let active: Vec<Uuid> = inner.state.groups.iter().filter(|g| !g.removed).map(|g| g.id).collect();
+        let active: Vec<Uuid> = inner.state.groups.iter().filter(|g| !g.removed && g.halted.is_none()).map(|g| g.id).collect();
         for gid in &active {
             if let Err(e) = self.sync_group(&mut inner, &token, *gid, &mut events).await {
                 tracing::warn!("sync of group {gid} failed: {e}");
@@ -629,12 +687,14 @@ impl Hermes {
                                 role: Role::Member,
                                 last_id: 0,
                                 removed: false,
+                                halted: None,
                                 messages: Vec::new(),
                                 names: Default::default(),
                             });
                             events.push(HermesEvent::GroupsChanged);
                             None
                         }
+                        Err(Error::InvalidChange(reason)) => Some(format!("The invitation was refused: {reason}.")),
                         Err(e) => Some(format!("The invitation could not be opened: {e}")),
                     }
                 }
@@ -650,21 +710,17 @@ impl Hermes {
         Ok(())
     }
 
-    /// Applies role changes and detects removal (the server stops showing the
-    /// membership the moment an admin's Remove commit is accepted).
+    /// Detects removal (the server stops showing the membership the moment an
+    /// admin's Remove commit is accepted). Roles are not taken from the server:
+    /// they come from the MLS group state, see [`Hermes::refresh_role`].
     async fn refresh_memberships(&self, inner: &mut Inner, token: &str, events: &mut Vec<HermesEvent>) -> Result<()> {
         let Some(user_id) = inner.my_user_id() else { return Ok(()) };
         let rows = self.sb()?.my_memberships(token, user_id).await?;
         let mut removed = Vec::new();
         let mut changed = false;
         for g in inner.state.groups.iter_mut().filter(|g| !g.removed) {
-            match rows.iter().find(|r| r.group_id == g.id) {
-                Some(r) if r.role != g.role => {
-                    g.role = r.role;
-                    changed = true;
-                }
-                Some(_) => {}
-                None => removed.push(g.id),
+            if !rows.iter().any(|r| r.group_id == g.id) {
+                removed.push(g.id);
             }
         }
         for gid in removed {
@@ -687,6 +743,15 @@ impl Hermes {
         Ok(())
     }
 
+    /// Takes this device's role from the MLS group state.
+    fn refresh_role(&self, inner: &mut Inner, group_id: Uuid, group: &MlsGroup) -> Result<bool> {
+        let role = mls::roles(group).map_or(Role::Member, |r| r.role_of(&inner.device.credential_hex()));
+        let g = inner.group_mut(group_id)?;
+        let changed = g.role != role;
+        g.role = role;
+        Ok(changed)
+    }
+
     /// Settles a commit whose server outcome was unknown (network error).
     async fn reconcile_pending(&self, inner: &mut Inner, token: &str, group_id: Uuid, group: &mut MlsGroup) -> Result<()> {
         if !Device::has_pending_commit(group) {
@@ -702,21 +767,32 @@ impl Hermes {
 
     async fn sync_group(&self, inner: &mut Inner, token: &str, group_id: Uuid, events: &mut Vec<HermesEvent>) -> Result<()> {
         let sb = self.sb()?;
+        if let Some(reason) = inner.group_mut(group_id)?.halted.clone() {
+            return Err(Error::InvalidChange(reason));
+        }
         let mut group = inner.load_group(group_id)?;
         self.reconcile_pending(inner, token, group_id, &mut group).await?;
-        loop {
-            let after = inner.group_mut(group_id)?.last_id;
-            let rows = sb.messages_after(token, group_id, after, PAGE).await?;
-            if rows.is_empty() {
-                return Ok(());
-            }
-            for row in &rows {
-                if !self.apply_row(inner, group_id, &mut group, row, events)? {
+        let result = async {
+            loop {
+                let after = inner.group_mut(group_id)?.last_id;
+                let rows = sb.messages_after(token, group_id, after, PAGE).await?;
+                if rows.is_empty() {
                     return Ok(());
                 }
-                inner.group_mut(group_id)?.last_id = row.id;
+                for row in &rows {
+                    if !self.apply_row(inner, group_id, &mut group, row, events)? {
+                        return Ok(());
+                    }
+                    inner.group_mut(group_id)?.last_id = row.id;
+                }
             }
         }
+        .await;
+        let still_member = !inner.group_mut(group_id)?.removed;
+        if still_member && self.refresh_role(inner, group_id, &group)? {
+            events.push(HermesEvent::GroupsChanged);
+        }
+        result
     }
 
     /// Returns false when processing must stop (removed, or a gap in epochs).
@@ -754,6 +830,15 @@ impl Hermes {
                 Ok(false)
             }
             Ok(Incoming::Commit { .. } | Incoming::Ignored) => Ok(true),
+            Err(Error::InvalidChange(reason)) => {
+                // Not merged: the epoch stays where it was. Everything after
+                // this commit builds on it, so the group can't safely go on.
+                tracing::error!("group {group_id}: refused commit in row {}: {reason}", row.id);
+                inner.group_mut(group_id)?.halted = Some(reason.clone());
+                events.push(HermesEvent::InvalidChange { group_id, reason });
+                events.push(HermesEvent::GroupsChanged);
+                Ok(false)
+            }
             Ok(Incoming::Application { sender, data }) => {
                 if sender != row.sender_credential {
                     tracing::warn!("row {}: MLS sender differs from the server's record; dropped", row.id);
@@ -790,7 +875,7 @@ impl Hermes {
             .state
             .groups
             .iter()
-            .filter(|g| !g.removed && g.role.is_admin())
+            .filter(|g| !g.removed && g.halted.is_none() && g.role.is_admin())
             .map(|g| g.id)
             .collect();
         if admin_groups.is_empty() {
@@ -814,6 +899,10 @@ impl Hermes {
                 for attempt in 0..2 {
                     self.sync_group(inner, token, dep.group_id, events).await?;
                     let mut group = inner.load_group(dep.group_id)?;
+                    let roles = mls::roles(&group).ok_or_else(|| Error::Mls("group has no roles".into()))?;
+                    if roles.role_of(&dep.credential) == Role::Admin && roles.role_of(&inner.device.credential_hex()) != Role::Owner {
+                        return Ok(()); // only the owner may remove an admin
+                    }
                     let commit = inner.device.remove_member(&mut group, &dep.credential)?;
                     match sb.complete_departure(token, dep.id, epoch(&group), &B64.encode(commit)).await {
                         Ok(_) => return inner.device.merge_pending_commit(&mut group),
@@ -926,6 +1015,23 @@ impl Hermes {
         }
     }
 
+    /// Test support: acts as a *modified* client that accepts a join request
+    /// whatever its role in the group. Honest clients never do this.
+    #[doc(hidden)]
+    pub async fn force_accept_join(&self, req: &JoinRequestRow) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let token = self.token(&mut inner).await?;
+        let mut events = Vec::new();
+        self.accept(&mut inner, &token, req, &mut events).await?;
+        self.save(&mut inner)
+    }
+
+    /// Test support: this device's MLS epoch for the group.
+    #[doc(hidden)]
+    pub async fn epoch(&self, group_id: Uuid) -> Result<i64> {
+        Ok(epoch(&self.inner.lock().await.load_group(group_id)?))
+    }
+
     /// Test support: the server user id of the current session.
     #[doc(hidden)]
     pub async fn user_id(&self) -> Option<Uuid> {
@@ -943,7 +1049,7 @@ impl Hermes {
 }
 
 fn group_info(g: &GroupState) -> GroupInfo {
-    GroupInfo { id: g.id, name: g.name.clone(), role: g.role, removed: g.removed }
+    GroupInfo { id: g.id, name: g.name.clone(), role: g.role, removed: g.removed, halted: g.halted.clone() }
 }
 
 #[cfg(test)]

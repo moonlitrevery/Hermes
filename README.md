@@ -47,8 +47,35 @@ supabase/tests/       pgTAP tests
 |---|---|
 | Joining | You can read from your join epoch on. Older messages are hidden by RLS, and MLS never gave you their keys anyway. |
 | Removal | An MLS Remove commit. The removed device can't decrypt anything sent afterwards, and the server stops serving it the group. |
-| Leaving | The server stops serving you at once. An admin's app then commits the MLS Remove for your leaf. |
+| Leaving | The server stops serving you at once. An admin's app then commits the MLS Remove for your leaf. An admin first steps down (a commit), because only the owner may remove an admin. |
 | Roles | **Owner** (exactly one, can't be removed, promotes and demotes). **Admin** creates codes and removes members. **Member** chats. Only the owner can remove an admin. |
+
+### Roles are part of the group state, and every client enforces them
+
+Roles are stored in the MLS group itself. A private GroupContext extension names the owner and
+the admins. The GroupContext feeds the MLS key schedule, so all members provably hold the same
+roles, and only a commit can change them (promotion, demotion, removing an admin).
+
+Before merging any commit, every client checks it against the roles in force *before* the commit:
+
+| Commit | Allowed from |
+|---|---|
+| Add a member | owner or admin |
+| Remove a member | owner or admin |
+| Remove an admin | owner only |
+| Remove the owner | nobody |
+| Promote or demote | owner only (an admin may step down) |
+| Change the owner or the group name | nobody |
+| Any other proposal type | nobody |
+
+After the commit, everyone holding a role must still be in the group. Whoever joins also checks
+that their Welcome was signed by an owner or admin.
+
+If a commit breaks these rules, even one the server accepted, the client **doesn't merge it**: the
+epoch stays where it was, the group is frozen, and the app warns that the group received an
+invalid change. Every later commit builds on the bad one, so the honest members can't continue in
+that group. The owner should create a new one. The server checks the same rules (defence in
+depth), but clients don't rely on it.
 
 ### The server orders epochs
 
@@ -112,8 +139,8 @@ Because anonymous users are cheap, **turn on CAPTCHA for sign-ins** in the hoste
 - History lives only on devices (MLS deletes keys after use). A new device starts empty.
 - Members don't post self-updates, so post-compromise security only advances when an admin
   commits (adds or removes).
-- Roles are enforced by the server, not checked by clients against MLS state. A malicious server
-  could let a non-admin commit, but it still can't read or forge messages.
+- A malicious server can't sneak in a member, but it can *freeze* a group by accepting an invalid
+  commit (denial of service, which it could do anyway by dropping messages).
 - Text messages only, with no attachments.
 
 ## Setup
@@ -148,8 +175,9 @@ The two variables are compiled into the binary. On desktop they can also be give
 
 ```sh
 pnpm install                 # Supabase CLI
-cargo test -p hermes-core    # unit tests (MLS, vault, invite codes); integration tests show as ignored
+cargo test -p hermes-core    # unit tests (MLS and role rules, vault, invite codes); integration tests show as ignored
 pnpm db:start                # local stack on ports 553xx (separate from other projects)
 pnpm test:db                 # pgTAP: every policy and RPC, plus meta tests
-pnpm test:e2e                # Rust integration tests with real clients against the local stack
+pnpm test:e2e                # Rust integration tests with real clients against the local stack,
+                             # including one where the server's admin check is switched off
 ```

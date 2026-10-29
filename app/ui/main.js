@@ -138,6 +138,7 @@ function renderGroups() {
       b.type = "button";
       b.append(el("span", "group-name", g.name));
       if (g.removed) b.append(el("span", "tag", "removed"));
+      else if (g.halted) b.append(el("span", "tag warn", "frozen"));
       else if (g.role !== "member") b.append(el("span", "tag", ROLE_LABEL[g.role]));
       const n = state.unread.get(g.id) || 0;
       if (n) b.append(el("span", "badge", n > 99 ? "99+" : String(n)));
@@ -209,7 +210,7 @@ async function showInvite() {
 
 async function showMembers() {
   const group = activeGroup();
-  if (!group || group.removed) return;
+  if (!group || group.removed || group.halted) return;
   const list = el("ul", "members");
   const render = async () => {
     const members = await call("members", { groupId: group.id });
@@ -248,7 +249,7 @@ async function showMembers() {
   await render();
   await dialog({
     title: `${group.name}: members`,
-    text: "Removing someone rotates the group keys: they can't read anything sent afterwards.",
+    text: "Roles live in the encrypted group state, and every member's app checks them. Removing someone rotates the group keys: they can't read anything sent afterwards.",
     body: list,
     ok: "Done",
     cancel: false,
@@ -289,11 +290,17 @@ function closeChat() {
 function renderChatChrome() {
   const g = activeGroup();
   $("chat-title").textContent = g.name;
-  $("show-invite").hidden = g.removed || g.role === "member";
-  $("show-members").hidden = g.removed;
+  const frozen = g.removed || !!g.halted;
+  $("show-invite").hidden = frozen || g.role === "member";
+  $("show-members").hidden = frozen;
   $("leave").textContent = g.removed ? "Delete" : "Leave";
-  $("removed-banner").hidden = !g.removed;
-  $("composer").hidden = g.removed;
+  $("removed-banner").textContent = g.removed
+    ? "You were removed from this group. New messages can't be decrypted on this device."
+    : g.halted
+      ? `This group received an invalid change (${g.halted}). Hermes refused it and froze the group. Ask the owner to create a new one.`
+      : "";
+  $("removed-banner").hidden = !frozen;
+  $("composer").hidden = frozen;
 }
 
 async function openGroup(id) {
@@ -392,6 +399,12 @@ function onEvent({ payload }) {
     case "groups_changed":
       reloadGroups();
       break;
+    case "invalid_change": {
+      const g = state.groups.find((x) => x.id === payload.group_id);
+      banner(`${g ? g.name : "A group"} received an invalid change and was frozen: ${payload.reason}`);
+      reloadGroups();
+      break;
+    }
     case "join_failed":
       banner(payload.reason);
       reloadGroups();

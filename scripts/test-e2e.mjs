@@ -15,7 +15,7 @@ const env = {
 const extra = process.argv.slice(2).filter((a) => a !== "--");
 const result = spawnSync(
   "cargo",
-  ["test", "-p", "hermes-core", "--test", "local_supabase", "--", "--ignored", ...extra],
+  ["test", "-p", "hermes-core", "--test", "local_supabase", "--test", "compromised_server", "--", "--ignored", ...extra],
   { stdio: "inherit", env },
 );
 process.exit(result.status ?? 1);

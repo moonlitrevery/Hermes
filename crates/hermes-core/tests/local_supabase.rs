@@ -4,68 +4,16 @@
 //! stack's URL and keys and runs `cargo test -- --ignored`. Every test uses
 //! real `Hermes` clients: real anonymous sign-ins, real RPCs and RLS, real MLS.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use hermes_core::supabase::{Supabase, SupabaseConfig};
-use hermes_core::{Error, Hermes, HermesEvent, MemoryVault, Role};
+use common::*;
+use hermes_core::supabase::Supabase;
+use hermes_core::{Error, Hermes, HermesEvent, Role};
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
-const WAIT: Duration = Duration::from_secs(30);
-
-fn config() -> SupabaseConfig {
-    SupabaseConfig {
-        url: std::env::var("HERMES_TEST_SUPABASE_URL").unwrap_or_else(|_| "http://127.0.0.1:55321".into()),
-        anon_key: std::env::var("HERMES_TEST_SUPABASE_ANON_KEY").expect("HERMES_TEST_SUPABASE_ANON_KEY (see pnpm test:e2e)"),
-    }
-}
-
-async fn client(name: &str) -> Arc<Hermes> {
-    let dir = std::env::temp_dir().join(format!("hermes-it-{name}-{}", Uuid::new_v4()));
-    let h = Hermes::open(dir, Some(config()), &MemoryVault::default()).unwrap();
-    h.set_display_name(name).await.unwrap();
-    h
-}
-
-/// Superuser connection, used only to arrange time (expire codes) and to read
-/// raw ciphertext the way a compromised server could.
-async fn db() -> tokio_postgres::Client {
-    let url = std::env::var("HERMES_TEST_DB_URL").unwrap_or_else(|_| "postgresql://postgres:postgres@127.0.0.1:55322/postgres".into());
-    let (client, conn) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await.unwrap();
-    tokio::spawn(conn);
-    client
-}
-
-fn raw_code(invite: &str) -> String {
-    invite.replace('-', "")
-}
-
-/// A owns a group; B is a member (A's sync accepts, B's sync finishes the join).
-async fn group_with(a: &Hermes, b: &Hermes) -> Uuid {
-    let g = a.create_group("Ordem").await.unwrap();
-    let invite = a.create_invite(g.id).await.unwrap();
-    assert_eq!(b.join(&invite.code).await.unwrap(), g.id);
-    a.sync().await.unwrap();
-    b.sync().await.unwrap();
-    let groups = b.groups().await;
-    assert!(groups.iter().any(|x| x.id == g.id && x.name == "Ordem" && !x.removed), "B joined: {groups:?}");
-    g.id
-}
-
-async fn latest_application_payload(db: &tokio_postgres::Client, group: Uuid) -> String {
-    db.query_one(
-        "select payload from public.messages where group_id = $1::text::uuid and kind = 'application' order by id desc limit 1",
-        &[&group.to_string()],
-    )
-    .await
-    .unwrap()
-    .get(0)
-}
-
-fn texts(msgs: &[hermes_core::ChatMessage]) -> Vec<String> {
-    msgs.iter().map(|m| m.text.clone()).collect()
-}
 
 // ---- invites --------------------------------------------------------------------
 
@@ -105,7 +53,17 @@ async fn only_admins_create_codes() {
     let b_id = b.user_id().await.unwrap();
     a.set_role(g, b_id, Role::Admin).await.unwrap();
     b.sync().await.unwrap();
-    assert!(b.create_invite(g).await.is_ok(), "a promoted admin can");
+    assert_eq!(b.groups().await[0].role, Role::Admin, "the promotion arrived as a commit");
+
+    // B's app now admits people, and the owner's client accepts that commit.
+    let c = client("carla").await;
+    c.join(&b.create_invite(g).await.unwrap().code).await.unwrap();
+    b.sync().await.unwrap();
+    c.sync().await.unwrap();
+    let events = a.sync().await.unwrap();
+    assert!(!events.iter().any(|e| matches!(e, HermesEvent::InvalidChange { .. })), "{events:?}");
+    assert_eq!(a.members(g).await.unwrap().len(), 3);
+    assert!(c.groups().await.iter().any(|x| x.id == g));
 }
 
 // ---- epoch order ------------------------------------------------------------------
@@ -256,6 +214,23 @@ async fn member_who_leaves_is_removed_from_mls_by_an_admin() {
     let payload = latest_application_payload(&db().await, g).await;
     let err = b.try_decrypt_payload(g, &payload).await;
     assert!(matches!(err, Err(Error::Mls(_))), "must fail in MLS, got {err:?}");
+}
+
+#[tokio::test]
+#[ignore = "needs the local Supabase stack; run `pnpm test:e2e`"]
+async fn admin_steps_down_then_leaves() {
+    let (a, b) = (client("ana").await, client("bruno").await);
+    let g = group_with(&a, &b).await;
+    a.set_role(g, b.user_id().await.unwrap(), Role::Admin).await.unwrap();
+    b.sync().await.unwrap();
+
+    // Leaving as an admin first commits the step-down, then leaves; the
+    // owner's app accepts both commits and removes B from the MLS group.
+    b.leave_group(g).await.unwrap();
+    let events = a.sync().await.unwrap();
+    assert!(!events.iter().any(|e| matches!(e, HermesEvent::InvalidChange { .. })), "{events:?}");
+    assert_eq!(a.members(g).await.unwrap().len(), 1);
+    a.send(g, "sozinha").await.unwrap();
 }
 
 // ---- two live clients ----------------------------------------------------------
